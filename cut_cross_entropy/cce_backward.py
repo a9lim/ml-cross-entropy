@@ -3,7 +3,7 @@ import torch
 import triton
 import triton.language as tl
 
-from cut_cross_entropy.tl_autotune import cce_backward_autotune
+from cut_cross_entropy.tl_autotune import cce_backward_autotune, cce_fixed_block_shape
 from cut_cross_entropy.tl_utils import (
     b_bin_fn,
     is_triton_greater_or_equal_3_2_0,
@@ -88,6 +88,9 @@ def _cce_backward_kernel(
     VocabOrdering,
     softcap,
     Targets,
+    RowMax,
+    NegCorrectLogit,
+    TileFlags,
     dE,
     dEC,
     dELocks,
@@ -129,6 +132,8 @@ def _cce_backward_kernel(
     HAS_SOFTCAP: tl.constexpr,
     HAS_DLSE: tl.constexpr,
     HAS_SHIFT: tl.constexpr,
+    HAS_TILE_FLAGS: tl.constexpr,
+    SKIP_EARLY: tl.constexpr,
     KAHAN_E: tl.constexpr,
     KAHAN_C: tl.constexpr,
     COMPUTE_DC: tl.constexpr,
@@ -145,6 +150,9 @@ def _cce_backward_kernel(
     group_size_b = min(num_b_chunks - first_pid_b, GROUP_B)
     pid_b = (first_pid_b + ((pid % num_v_in_group) % group_size_b)).to(tl.int64)
     pid_v = ((pid % num_v_in_group) // group_size_b).to(tl.int64)
+    # The launch is grouped for L2 reuse; TileFlags is row-major over the tile
+    # grid itself, so that it reads back as [n_b_tiles, n_v_tiles].
+    tile_id = pid_b * num_v_chunks + pid_v
 
     offs_b = (pid_b * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
     if HAS_VALIDS:
@@ -153,6 +161,52 @@ def _cce_backward_kernel(
     offs_v = (pid_v * BLOCK_V + tl.arange(0, BLOCK_V)).to(tl.int64)
     if HAS_VOCAB_ORDERING:
         offs_v = tl.load(VocabOrdering + offs_v, mask=offs_v < V, other=V).to(tl.int64)
+
+    if SKIP_EARLY and (FILTER_E_GRAD and COMPUTE_DE) and (FILTER_C_GRAD and COMPUTE_DC):
+        # Exact skip before the recompute.  The forward stored, per row and per
+        # vocab tile, the largest logit over the tile's non-target columns.
+        # Those columns contribute d_accum = exp(logit - lse) below; subtracting
+        # a constant and exp are both monotone, so exp(row max - lse) is the
+        # largest of them.  The target column, when it falls in this tile, is
+        # exp(-neg_correct_logit - lse) + (-1.0) -- the same float ops the
+        # recompute would perform, on the same fp32 logit.  A tile in which
+        # every row is filtered is therefore exactly a tile the filter after
+        # the recompute would drop, so drop it before the recompute GEMM.
+        # Every test is written as `< filter_eps`, matching _block_is_filtered,
+        # so a non-finite value is never filtered and its tile is computed.
+        row_offs_b = (pid_b * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
+        row_mask = row_offs_b < B
+        pre_lse = tl.load(LSE + row_offs_b, mask=row_mask, other=float("inf"))
+        pre_row_max = tl.load(RowMax + pid_v * B + row_offs_b, mask=row_mask, other=-float("inf"))
+        row_filtered = tl.abs(tl.exp(pre_row_max - pre_lse)) < filter_eps
+
+        if HAS_TARGETS:
+            if HAS_SHIFT:
+                pre_target_offs_b = offs_b + shift
+            else:
+                pre_target_offs_b = offs_b
+
+            pre_targets = tl.load(
+                Targets + pre_target_offs_b, mask=pre_target_offs_b < BMax, other=V + 1
+            )
+            pre_ncl = tl.load(NegCorrectLogit + row_offs_b, mask=row_mask, other=0.0)
+            # Whether the target column falls in this tile, tested exactly the
+            # way the recompute tests it, so a vocab ordering -- which makes the
+            # tile's columns an arbitrary set -- is handled too.
+            target_outside = (
+                tl.max((pre_targets[:, None] == offs_v[None, :]).to(tl.int32), axis=1) == 0
+            )
+            # A target column past V is masked to zero before the -1 is added,
+            # so its |d_accum| is 1 and the tile is never filtered on it.
+            target_filtered = (pre_targets < V) & (
+                tl.abs(tl.exp(-pre_ncl - pre_lse) + (-1.0)) < filter_eps
+            )
+            row_filtered = row_filtered & (target_outside | target_filtered)
+
+        if tl.reduce(row_filtered, None, tl_and_reduce_fn):
+            if HAS_TILE_FLAGS:
+                tl.store(TileFlags + tile_id, 0)
+            return
 
     offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
     e_ptrs = E + (offs_b[:, None] * stride_eb + offs_d[None, :] * stride_ed)
@@ -212,9 +266,14 @@ def _cce_backward_kernel(
     should_skip = False
     if (FILTER_E_GRAD and COMPUTE_DE) and (FILTER_C_GRAD and COMPUTE_DC):
         if _block_is_filtered(tl.abs(d_accum), filter_eps):
+            if HAS_TILE_FLAGS:
+                tl.store(TileFlags + tile_id, 2)
             return
     elif (FILTER_E_GRAD and COMPUTE_DE) or (FILTER_C_GRAD and COMPUTE_DC):
         should_skip = _block_is_filtered(tl.abs(d_accum), filter_eps)
+
+    if HAS_TILE_FLAGS:
+        tl.store(TileFlags + tile_id, 1)
 
     if ITEM_DO:
         d_out = tl.load(dOut)
@@ -329,6 +388,8 @@ _cce_backward_kernel = triton.heuristics(  # type: ignore
         "HAS_SOFTCAP": lambda args: args["softcap"] is not None,
         "HAS_DLSE": lambda args: args["dLSE"] is not None,
         "HAS_SHIFT": lambda args: args["shift"] != 0,
+        "HAS_TILE_FLAGS": lambda args: args["TileFlags"] is not None,
+        "SKIP_EARLY": lambda args: args["RowMax"] is not None,
         "ITEM_DO": lambda args: args["dOut"].numel() == 1,
         "GROUP_B": lambda args: 8,
         "COMPUTE_DC": lambda args: args["dC"] is not None,
@@ -360,6 +421,9 @@ def cce_backward_kernel(
     targets: torch.Tensor | None = None,
     shift: int = 0,
     vocab_ordering: torch.Tensor | None = None,
+    row_max: torch.Tensor | None = None,
+    neg_correct_logit: torch.Tensor | None = None,
+    tile_flags: torch.Tensor | None = None,
     grad_scale: float = 1.0,
     accum_e_fp32: bool = False,
     accum_c_fp32: bool = False,
@@ -451,7 +515,32 @@ def cce_backward_kernel(
     if vocab_ordering is not None:
         assert vocab_ordering.ndim == 1
         assert vocab_ordering.numel() == c.size(0)
+        assert vocab_ordering.dtype == torch.int32
         assert vocab_ordering.stride(0) == 1
+
+    # The tile grid the flags and the row max are indexed by exists only when
+    # the block shape is fixed, which is also what couples this kernel's tiling
+    # to the forward's.
+    block_shape = cce_fixed_block_shape(e.dtype)
+    if tile_flags is not None:
+        assert block_shape is not None, "tile_flags needs the fixed (non-autotuned) config"
+        assert tile_flags.dtype == torch.int32
+        assert tile_flags.is_contiguous()
+        assert tile_flags.shape == (
+            triton.cdiv(B, block_shape[0]),
+            triton.cdiv(c.size(0), block_shape[1]),
+        )
+
+    if row_max is not None:
+        # A vocab ordering permutes each program's columns, so the row max only
+        # bounds this tile if the forward tiled the vocabulary the same way.
+        assert block_shape is not None, "row_max needs the fixed (non-autotuned) config"
+        assert vocab_ordering is not None, "row_max is only valid for a known vocab tiling"
+        assert neg_correct_logit is not None
+        assert row_max.is_contiguous()
+        assert row_max.shape == (triton.cdiv(c.size(0), block_shape[1]), B)
+        assert neg_correct_logit.is_contiguous()
+        assert neg_correct_logit.shape == (B,)
 
     nd_locks = triton.cdiv(c.size(1), 64)
     if de is not None:
@@ -480,6 +569,9 @@ def cce_backward_kernel(
         vocab_ordering,
         softcap,
         targets,
+        row_max,
+        neg_correct_logit,
+        tile_flags,
         de,
         dec,
         de_locks,

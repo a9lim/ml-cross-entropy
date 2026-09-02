@@ -59,6 +59,21 @@ CCE_OPTS_DOC = [
     """
     :param filter_c_grad: Whether or not to apply gradient filter to the classifier gradient (dC). If filter_eps is None, this
         will be set to False.""",
+    """
+    :param vocab_ordering: An int32 permutation of the classifier rows, shape (NumClasses,). When given, both
+        the forward and the backward tile the vocabulary in this order instead of the backward sorting the
+        vocabulary by the batch's mean logit. Tiling by a static, frequency-derived order clusters the columns
+        the gradient filter drops, and lets the backward skip a filtered tile before its recompute matmul
+        rather than after it. Requires no softcap, no vocab parallelism, and the fixed (non-autotuned) block
+        shape; it is an exact scheduling hint, so a poor ordering costs skipped tiles and never correctness.""",
+    """
+    :param tile_flags: Optional int32 tensor of shape (cdiv(NumTokens, BLOCK_B), cdiv(NumClasses, BLOCK_V))
+        that the backward fills with one flag per tile: 1 computed, 0 skipped before the recompute, 2 skipped
+        by the filter after the recompute. Debug output only.""",
+    """
+    :param skip_early: Whether the backward may drop a filtered tile before its recompute matmul. Setting this
+        False forces the late-filter-only path over the same tile grid, so a caller can check with tile_flags
+        that the two decide identically.""",
 ]
 
 IMPL_DOC = """

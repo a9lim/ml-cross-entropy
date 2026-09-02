@@ -63,6 +63,9 @@ def linear_cross_entropy(
     accum_c_fp32: bool = False,
     filter_e_grad: bool = True,
     filter_c_grad: bool = True,
+    vocab_ordering: torch.Tensor | None = None,
+    tile_flags: torch.Tensor | None = None,
+    skip_early: bool = True,
     impl: str | LinearCrossEntropyImpl = LCE_IMPL_DEFAULT,
     vocab_parallel_options: VocabParallelOptions | None = None,
 ) -> torch.Tensor: ...
@@ -84,6 +87,9 @@ def linear_cross_entropy(
     accum_c_fp32: bool = False,
     filter_e_grad: bool = True,
     filter_c_grad: bool = True,
+    vocab_ordering: torch.Tensor | None = None,
+    tile_flags: torch.Tensor | None = None,
+    skip_early: bool = True,
     impl: str | LinearCrossEntropyImpl = LCE_IMPL_DEFAULT,
     vocab_parallel_options: VocabParallelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
@@ -105,6 +111,9 @@ def linear_cross_entropy(
     accum_c_fp32: bool = False,
     filter_e_grad: bool = True,
     filter_c_grad: bool = True,
+    vocab_ordering: torch.Tensor | None = None,
+    tile_flags: torch.Tensor | None = None,
+    skip_early: bool = True,
     impl: str | LinearCrossEntropyImpl = LCE_IMPL_DEFAULT,
     vocab_parallel_options: VocabParallelOptions | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
@@ -129,6 +138,9 @@ def linear_cross_entropy(
     accum_c_fp32: bool = False,
     filter_e_grad: bool = True,
     filter_c_grad: bool = True,
+    vocab_ordering: torch.Tensor | None = None,
+    tile_flags: torch.Tensor | None = None,
+    skip_early: bool = True,
     impl: str | LinearCrossEntropyImpl = LCE_IMPL_DEFAULT,
     vocab_parallel_options: VocabParallelOptions | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -199,8 +211,15 @@ def linear_cross_entropy(
             **cce_opts,
             vocab_parallel_options=vocab_parallel_options,
             return_lse=return_lse,
+            vocab_ordering=vocab_ordering,
+            tile_flags=tile_flags,
+            skip_early=skip_early,
         )
     elif impl == "torch_compile":
+        if vocab_ordering is not None or tile_flags is not None:
+            raise ValueError(
+                "vocab_ordering and tile_flags are only supported by the cce implementations."
+            )
         loss, lse = torch_compile_linear_cross_entropy(
             e,
             c,

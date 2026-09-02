@@ -494,6 +494,19 @@ def _cce_best_config_fp32() -> Config:
     return Config(dict(BLOCK_B=32, BLOCK_V=128, BLOCK_D=32), num_warps=4, num_stages=3)
 
 
+def cce_fixed_block_shape(e_dtype: torch.dtype) -> tuple[int, int] | None:
+    """(BLOCK_B, BLOCK_V) of the fixed config, or None when autotuning.
+
+    The exact skip-early needs the forward and the backward to walk the same
+    (token tile, vocab tile) grid, which only the fixed configs guarantee.
+    """
+    if _AUTOTUNE:
+        return None
+
+    kwargs = (_cce_best_config_fp32() if e_dtype == torch.float32 else _cce_best_config()).kwargs
+    return int(kwargs["BLOCK_B"]), int(kwargs["BLOCK_V"])
+
+
 def cce_forward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heuristics]:
     if _AUTOTUNE:
         return _cce_autotune(

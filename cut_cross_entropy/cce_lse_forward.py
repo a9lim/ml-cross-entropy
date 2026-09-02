@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from cut_cross_entropy.tl_autotune import cce_forward_autotune
+from cut_cross_entropy.tl_autotune import cce_fixed_block_shape, cce_forward_autotune
 from cut_cross_entropy.tl_utils import b_bin_fn, tl_logaddexp, tl_softcapping
 
 
@@ -16,9 +16,11 @@ def _cce_lse_forward_kernel(
     LSE,
     LA,
     NegCorrectLogit,
+    RowMax,
     Locks,
     Valids,
     Targets,
+    VocabOrdering,
     softcap,
     shift,
     B,
@@ -46,6 +48,8 @@ def _cce_lse_forward_kernel(
     DOT_PRECISION: tl.constexpr,
     HAS_TARGETS: tl.constexpr,
     HAS_SHIFT: tl.constexpr,
+    HAS_ROWMAX: tl.constexpr,
+    HAS_VOCAB_ORDERING: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_b = tl.cdiv(B, BLOCK_B)
@@ -62,6 +66,9 @@ def _cce_lse_forward_kernel(
         offs_b = tl.load(Valids + stride_vb * offs_b, mask=offs_b < B, other=BMax).to(tl.int64)
 
     offs_v = (pid_v * BLOCK_V + tl.arange(0, BLOCK_V)).to(tl.int64)
+    if HAS_VOCAB_ORDERING:
+        offs_v = tl.load(VocabOrdering + offs_v, mask=offs_v < V, other=V).to(tl.int64)
+
     offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
     e_ptrs = E + (offs_b[:, None] * stride_eb + offs_d[None, :] * stride_ed)
     c_ptrs = C + (offs_v[None, :] * stride_cv + offs_d[:, None] * stride_cd)
@@ -117,6 +124,23 @@ def _cce_lse_forward_kernel(
             neg_correct_logit_ptrs[:, None], (BLOCK_B, BLOCK_V)
         )
         tl.store(neg_correct_logit_ptrs, -logits, mask=this_targets[:, None] == offs_v[None, :])
+
+        if HAS_ROWMAX:
+            # The largest logit over this tile's non-target columns.  Those
+            # columns contribute d_accum = exp(logit - lse) to the backward's
+            # gradient filter, and both the subtraction and exp are monotone,
+            # so this single value decides all of them.  Columns past V are
+            # already -inf (the tail-tile mask above) and the target column is
+            # masked to -inf here, so neither can raise the bound.
+            nt_logits = tl.where(this_targets[:, None] == offs_v[None, :], -float("inf"), logits)
+            # tl.max does not propagate NaN, and the backward keeps every tile
+            # it cannot prove small (its test is written `< filter_eps`), so a
+            # non-finite logit must not hide inside a finite bound: send the
+            # whole row to the slow path instead.
+            nt_logits = tl.where(nt_logits != nt_logits, float("inf"), nt_logits)
+            # Stored tile-major so a backward program reads BLOCK_B contiguous
+            # floats.
+            tl.store(RowMax + pid_v * B + offs_b, tl.max(nt_logits, axis=1), mask=offs_b < B)
     else:
         offs_b = (pid_b * BLOCK_B + tl.arange(0, BLOCK_B)).to(tl.int64)
 
@@ -153,6 +177,8 @@ _cce_lse_forward_kernel = triton.heuristics(  # type: ignore
         else "ieee",
         "HAS_TARGETS": lambda args: args["Targets"] is not None,
         "HAS_SHIFT": lambda args: args["shift"] != 0,
+        "HAS_ROWMAX": lambda args: args["RowMax"] is not None,
+        "HAS_VOCAB_ORDERING": lambda args: args["VocabOrdering"] is not None,
     }
 )(_cce_lse_forward_kernel)
 _cce_lse_forward_kernel = cce_forward_autotune()(_cce_lse_forward_kernel)  # type: ignore
@@ -163,6 +189,7 @@ class LSEReturn:
     lse: torch.Tensor
     logit_avg: torch.Tensor | None
     neg_correct_logit: torch.Tensor | None
+    row_max: torch.Tensor | None
 
 
 def cce_lse_forward_kernel(
@@ -174,7 +201,17 @@ def cce_lse_forward_kernel(
     targets: torch.Tensor | None = None,
     shift: int = 0,
     return_logit_avg: bool = False,
+    return_row_max: bool = False,
+    vocab_ordering: torch.Tensor | None = None,
 ) -> LSEReturn:
+    """Compute the per-row LSE, and optionally the classifier's mean logit.
+
+    ``vocab_ordering`` is an int32 permutation of the classifier rows; when it
+    is given, the vocabulary is tiled in that order.  ``return_row_max`` then
+    also stores, per (vocab tile, row), the largest logit over that tile's
+    non-target columns, which is what lets the backward decide a tile's
+    gradient filter before recomputing its logits.
+    """
     # Check constraints.
     assert e.shape[1] == c.shape[1], "Incompatible dimensions"
     assert e.is_contiguous(), "Matrix A must be contiguous"
@@ -205,6 +242,24 @@ def cce_lse_forward_kernel(
     else:
         logit_avg = None
 
+    if vocab_ordering is not None:
+        assert vocab_ordering.ndim == 1
+        assert vocab_ordering.numel() == c.size(0)
+        assert vocab_ordering.dtype == torch.int32
+        assert vocab_ordering.stride(0) == 1
+
+    if return_row_max:
+        assert vocab_ordering is not None, "the row max is only valid for a known vocab tiling"
+        assert targets is not None, "the row max excludes the target column"
+        assert softcap is None, "softcap is applied at a different width in the backward"
+        block_shape = cce_fixed_block_shape(e.dtype)
+        assert block_shape is not None, "the row max needs the fixed (non-autotuned) config"
+        # [vocab tile, row]: every element is written by exactly one program,
+        # before any backward program reads it, so it needs no initialization.
+        row_max = e.new_empty((triton.cdiv(V, block_shape[1]), B), dtype=torch.float32)
+    else:
+        row_max = None
+
     # 1D launch kernel where each block gets its own program.
     def grid(META) -> tuple[int]:
         return (triton.cdiv(B, META["BLOCK_B"]) * triton.cdiv(V, META["BLOCK_V"]),)
@@ -216,9 +271,11 @@ def cce_lse_forward_kernel(
         lse,
         logit_avg,
         neg_correct_logit,
+        row_max,
         locks,
         valids,
         targets,
+        vocab_ordering,
         softcap,
         shift,
         B,
@@ -235,4 +292,4 @@ def cce_lse_forward_kernel(
         B_BIN=b_bin_fn(B),
     )
 
-    return LSEReturn(lse, logit_avg, neg_correct_logit)
+    return LSEReturn(lse, logit_avg, neg_correct_logit, row_max)
