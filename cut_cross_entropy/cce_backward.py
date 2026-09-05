@@ -90,6 +90,7 @@ def _cce_backward_kernel(
     Targets,
     RowMax,
     NegCorrectLogit,
+    TargetTile,
     TileFlags,
     dE,
     dEC,
@@ -133,6 +134,7 @@ def _cce_backward_kernel(
     HAS_DLSE: tl.constexpr,
     HAS_SHIFT: tl.constexpr,
     HAS_TILE_FLAGS: tl.constexpr,
+    HAS_TARGET_TILE: tl.constexpr,
     SKIP_EARLY: tl.constexpr,
     KAHAN_E: tl.constexpr,
     KAHAN_C: tl.constexpr,
@@ -159,7 +161,7 @@ def _cce_backward_kernel(
         offs_b = tl.load(Valids + stride_vb * offs_b, mask=offs_b < B, other=BMax).to(tl.int64)
 
     offs_v = (pid_v * BLOCK_V + tl.arange(0, BLOCK_V)).to(tl.int64)
-    if HAS_VOCAB_ORDERING:
+    if HAS_VOCAB_ORDERING and not (SKIP_EARLY and HAS_TARGET_TILE):
         offs_v = tl.load(VocabOrdering + offs_v, mask=offs_v < V, other=V).to(tl.int64)
 
     if SKIP_EARLY and (FILTER_E_GRAD and COMPUTE_DE) and (FILTER_C_GRAD and COMPUTE_DC):
@@ -193,9 +195,12 @@ def _cce_backward_kernel(
             # Whether the target column falls in this tile, tested exactly the
             # way the recompute tests it, so a vocab ordering -- which makes the
             # tile's columns an arbitrary set -- is handled too.
-            target_outside = (
-                tl.max((pre_targets[:, None] == offs_v[None, :]).to(tl.int32), axis=1) == 0
-            )
+            if HAS_TARGET_TILE:
+                target_outside = tl.load(TargetTile + row_offs_b, mask=row_mask, other=-1) != pid_v
+            else:
+                target_outside = (
+                    tl.max((pre_targets[:, None] == offs_v[None, :]).to(tl.int32), axis=1) == 0
+                )
             # A target column past V is masked to zero before the -1 is added,
             # so its |d_accum| is 1 and the tile is never filtered on it.
             target_filtered = (pre_targets < V) & (
@@ -207,6 +212,9 @@ def _cce_backward_kernel(
             if HAS_TILE_FLAGS:
                 tl.store(TileFlags + tile_id, 0)
             return
+
+    if HAS_VOCAB_ORDERING and SKIP_EARLY and HAS_TARGET_TILE:
+        offs_v = tl.load(VocabOrdering + offs_v, mask=offs_v < V, other=V).to(tl.int64)
 
     offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
     e_ptrs = E + (offs_b[:, None] * stride_eb + offs_d[None, :] * stride_ed)
@@ -389,6 +397,7 @@ _cce_backward_kernel = triton.heuristics(  # type: ignore
         "HAS_DLSE": lambda args: args["dLSE"] is not None,
         "HAS_SHIFT": lambda args: args["shift"] != 0,
         "HAS_TILE_FLAGS": lambda args: args["TileFlags"] is not None,
+        "HAS_TARGET_TILE": lambda args: args["TargetTile"] is not None,
         "SKIP_EARLY": lambda args: args["RowMax"] is not None,
         "ITEM_DO": lambda args: args["dOut"].numel() == 1,
         "GROUP_B": lambda args: 8,
@@ -397,9 +406,9 @@ _cce_backward_kernel = triton.heuristics(  # type: ignore
         "KAHAN_E": lambda args: args["dEC"] is not None,
         "KAHAN_C": lambda args: args["dCC"] is not None,
         "COMPUTE_DBIAS": lambda args: args["dBias"] is not None,
-        "DOT_PRECISION": lambda args: "tf32"
-        if torch.get_float32_matmul_precision() == "high"
-        else "ieee",
+        "DOT_PRECISION": lambda args: (
+            "tf32" if torch.get_float32_matmul_precision() == "high" else "ieee"
+        ),
     }
 )(_cce_backward_kernel)
 _cce_backward_kernel = cce_backward_autotune()(_cce_backward_kernel)  # type: ignore
@@ -431,6 +440,7 @@ def cce_backward_kernel(
     filter_c_grad: bool = True,
     reduce_e_grad: bool = False,
     pg: torch.distributed.ProcessGroup | None = None,
+    target_tile: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert do.numel() in (e.size(0), 1)
     assert c.size(1) == e.size(1)
@@ -541,6 +551,10 @@ def cce_backward_kernel(
         assert row_max.shape == (triton.cdiv(c.size(0), block_shape[1]), B)
         assert neg_correct_logit.is_contiguous()
         assert neg_correct_logit.shape == (B,)
+        if target_tile is not None:
+            assert target_tile.is_contiguous()
+            assert target_tile.dtype == torch.int32
+            assert target_tile.shape == (B,)
 
     nd_locks = triton.cdiv(c.size(1), 64)
     if de is not None:
@@ -571,6 +585,7 @@ def cce_backward_kernel(
         targets,
         row_max,
         neg_correct_logit,
+        target_tile,
         tile_flags,
         de,
         dec,

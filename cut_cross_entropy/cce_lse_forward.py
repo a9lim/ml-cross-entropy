@@ -17,6 +17,7 @@ def _cce_lse_forward_kernel(
     LA,
     NegCorrectLogit,
     RowMax,
+    TargetTile,
     Locks,
     Valids,
     Targets,
@@ -123,16 +124,31 @@ def _cce_lse_forward_kernel(
         neg_correct_logit_ptrs = tl.broadcast_to(
             neg_correct_logit_ptrs[:, None], (BLOCK_B, BLOCK_V)
         )
-        tl.store(neg_correct_logit_ptrs, -logits, mask=this_targets[:, None] == offs_v[None, :])
+        is_target = this_targets[:, None] == offs_v[None, :]
+        tl.store(neg_correct_logit_ptrs, -logits, mask=is_target)
 
         if HAS_ROWMAX:
+            # Every real target has one matching vocabulary column. Reuse that
+            # match to save its tile, rather than rebuilding a BLOCK_B x
+            # BLOCK_V membership matrix in every backward program, including
+            # programs that the early filter immediately skips. A ragged last
+            # tile maps padded columns to V: allow its first padded column to
+            # write, preserving the existing target==V membership semantics
+            # without several lanes writing the same address.
+            tile_ptrs = tl.broadcast_to((TargetTile + offs_b)[:, None], (BLOCK_B, BLOCK_V))
+            one_column = (offs_v < V) | (pid_v * BLOCK_V + tl.arange(0, BLOCK_V) == V)
+            tl.store(
+                tile_ptrs,
+                tl.broadcast_to(pid_v.to(tl.int32), (BLOCK_B, BLOCK_V)),
+                mask=is_target & one_column[None, :] & (offs_b[:, None] < B),
+            )
             # The largest logit over this tile's non-target columns.  Those
             # columns contribute d_accum = exp(logit - lse) to the backward's
             # gradient filter, and both the subtraction and exp are monotone,
             # so this single value decides all of them.  Columns past V are
             # already -inf (the tail-tile mask above) and the target column is
             # masked to -inf here, so neither can raise the bound.
-            nt_logits = tl.where(this_targets[:, None] == offs_v[None, :], -float("inf"), logits)
+            nt_logits = tl.where(is_target, -float("inf"), logits)
             # tl.max does not propagate NaN, and the backward keeps every tile
             # it cannot prove small (its test is written `< filter_eps`), so a
             # non-finite logit must not hide inside a finite bound: send the
@@ -172,9 +188,9 @@ _cce_lse_forward_kernel = triton.heuristics(  # type: ignore
         "HAS_SOFTCAP": lambda args: args["softcap"] is not None,
         "HAS_LA": lambda args: args["LA"] is not None,
         "GROUP_B": lambda args: 8,
-        "DOT_PRECISION": lambda args: "tf32"
-        if torch.get_float32_matmul_precision() == "high"
-        else "ieee",
+        "DOT_PRECISION": lambda args: (
+            "tf32" if torch.get_float32_matmul_precision() == "high" else "ieee"
+        ),
         "HAS_TARGETS": lambda args: args["Targets"] is not None,
         "HAS_SHIFT": lambda args: args["shift"] != 0,
         "HAS_ROWMAX": lambda args: args["RowMax"] is not None,
@@ -190,6 +206,7 @@ class LSEReturn:
     logit_avg: torch.Tensor | None
     neg_correct_logit: torch.Tensor | None
     row_max: torch.Tensor | None
+    target_tile: torch.Tensor | None = None
 
 
 def cce_lse_forward_kernel(
@@ -257,8 +274,11 @@ def cce_lse_forward_kernel(
         # [vocab tile, row]: every element is written by exactly one program,
         # before any backward program reads it, so it needs no initialization.
         row_max = e.new_empty((triton.cdiv(V, block_shape[1]), B), dtype=torch.float32)
+        # Invalid targets may have no matching column and retain this sentinel.
+        target_tile = e.new_full((B,), -1, dtype=torch.int32)
     else:
         row_max = None
+        target_tile = None
 
     # 1D launch kernel where each block gets its own program.
     def grid(META) -> tuple[int]:
@@ -272,6 +292,7 @@ def cce_lse_forward_kernel(
         logit_avg,
         neg_correct_logit,
         row_max,
+        target_tile,
         locks,
         valids,
         targets,
@@ -292,4 +313,4 @@ def cce_lse_forward_kernel(
         B_BIN=b_bin_fn(B),
     )
 
-    return LSEReturn(lse, logit_avg, neg_correct_logit, row_max)
+    return LSEReturn(lse, logit_avg, neg_correct_logit, row_max, target_tile)

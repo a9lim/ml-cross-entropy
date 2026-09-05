@@ -197,6 +197,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             logit_avg,
             ret.row_max,
             neg_correct_logit if ret.row_max is not None else None,
+            ret.target_tile,
         )
         ctx.params = params
         ctx.e_info = e_info
@@ -225,7 +226,18 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
     def backward(
         ctx, grad_out: torch.Tensor, grad_lse_out: torch.Tensor | None
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, None]:
-        e, c, bias, lse, targets, valids, logit_avg, row_max, neg_correct_logit = ctx.saved_tensors
+        (
+            e,
+            c,
+            bias,
+            lse,
+            targets,
+            valids,
+            logit_avg,
+            row_max,
+            neg_correct_logit,
+            target_tile,
+        ) = ctx.saved_tensors
         params = cast(CCEParams, ctx.params)
 
         if params.vocab_ordering is not None:
@@ -301,6 +313,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             filter_c_grad=params.filter_c_grad,
             reduce_e_grad=reduce_e_grad,
             pg=pg,
+            target_tile=target_tile,
         )
 
         return de, dc, dbias, None
