@@ -1,4 +1,4 @@
-"""Two-stage LSE numerical and CUDA-capture qualification."""
+"""Locked LSE must preserve visible nonfinite activations and replay inputs."""
 
 import pytest
 import torch
@@ -12,7 +12,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requ
 
 @pytest.mark.parametrize("vocab", [257, 4099])
 @pytest.mark.parametrize("nonfinite", [None, "nan", "inf"])
-def test_lse_tree_forward_and_gradients(vocab, nonfinite):
+def test_lse_nonfinite_forward_and_gradients(vocab, nonfinite):
     torch.manual_seed(945)
     b, d = 259, 128
     e = torch.randn(b, d, device="cuda", dtype=torch.bfloat16) * 0.125
@@ -22,14 +22,13 @@ def test_lse_tree_forward_and_gradients(vocab, nonfinite):
     order = torch.randperm(vocab, device="cuda", dtype=torch.int32)
     targets = torch.randint(vocab, (b,), device="cuda")
     results = []
-    for reduction in ("atomic", "tree"):
+    for _ in range(2):
         ret = cce_lse_forward_kernel(
             e,
             c,
             targets=targets,
             vocab_ordering=order,
             return_row_max=True,
-            lse_reduction=reduction,
         )
         de, dc, _ = cce_backward_kernel(
             do=torch.ones((), device="cuda"),
@@ -53,30 +52,29 @@ def test_lse_tree_forward_and_gradients(vocab, nonfinite):
             filter_c_grad=False,
         )
         results.append((ret, de, dc))
-    old, new = results
+    reference, replay = results
     if nonfinite is None:
-        torch.testing.assert_close(new[0].lse, old[0].lse, atol=2e-5, rtol=2e-5)
+        torch.testing.assert_close(replay[0].lse, reference[0].lse, atol=2e-5, rtol=2e-5)
     else:
-        # The legacy min/max logaddexp can discard NaN partials. Validate the
-        # new reduction against the dense head's finite/nonfinite row pattern,
-        # not against that masking behavior. A +inf logit may produce either
+        # Min/max logaddexp must not discard NaN partials. Validate the
+        # dense head's finite/nonfinite row pattern. A +inf logit may produce either
         # +inf or NaN through softmax arithmetic, but it must remain visible.
         dense_lse = torch.logsumexp((e @ c.T).float(), dim=1)
-        torch.testing.assert_close(torch.isfinite(new[0].lse), torch.isfinite(dense_lse))
+        torch.testing.assert_close(torch.isfinite(replay[0].lse), torch.isfinite(dense_lse))
     torch.testing.assert_close(
-        new[0].neg_correct_logit, old[0].neg_correct_logit, atol=0, rtol=0, equal_nan=True
+        replay[0].neg_correct_logit, reference[0].neg_correct_logit, atol=0, rtol=0, equal_nan=True
     )
-    for actual, reference in zip(new[1:], old[1:]):
+    for actual, reference in zip(replay[1:], reference[1:]):
         if nonfinite is None:
-            # FP32 reduction reassociation may move a BF16 probability across
-            # one rounding boundary; use the existing BF16 head's 1% envelope.
+            # Concurrent reduction order may move a BF16 probability across
+            # one rounding boundary; retain the existing BF16 head's 1% envelope.
             assert ((actual - reference).norm() / reference.norm()).item() < 1e-2
             assert torch.isfinite(actual).all()
         else:
             assert not torch.isfinite(actual).all()
 
 
-def test_lse_tree_cuda_graph_replay_reads_new_inputs():
+def test_lse_cuda_graph_replay_reads_new_inputs():
     torch.manual_seed(953)
     e = torch.randn(129, 128, device="cuda", dtype=torch.bfloat16) * 0.125
     c = torch.randn(4099, 128, device="cuda", dtype=torch.bfloat16) * 0.125
@@ -90,7 +88,6 @@ def test_lse_tree_cuda_graph_replay_reads_new_inputs():
             targets=targets,
             vocab_ordering=order,
             return_row_max=True,
-            lse_reduction="tree",
         )
 
     stream = torch.cuda.Stream()

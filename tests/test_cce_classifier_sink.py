@@ -11,8 +11,7 @@ from cut_cross_entropy.utils import TensorInfo, _handle_eps, compute_z_loss
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 
 
-@pytest.mark.parametrize("atomic", [False, True])
-def test_classifier_sink_preserves_fp32_reference_and_existing_contents(atomic, monkeypatch):
+def test_classifier_sink_preserves_fp32_reference_and_existing_contents(monkeypatch):
     torch.manual_seed(1033)
     b, v, d = 257, 1025, 128
     e = torch.randn(b, d, device="cuda", dtype=torch.bfloat16) * 0.125
@@ -52,7 +51,7 @@ def test_classifier_sink_preserves_fp32_reference_and_existing_contents(atomic, 
     sink = torch.zeros(c.shape, device="cuda", dtype=torch.float32)
     for count in (1, 2):
         de, dc, _ = cce_backward_kernel(
-            **kwargs, classifier_grad_sink=sink, classifier_sink_atomic=atomic
+            **kwargs, classifier_grad_sink=sink
         )
         assert dc is None
         torch.testing.assert_close(de, de_reference, rtol=1e-5, atol=1e-6)
@@ -64,8 +63,7 @@ def test_classifier_sink_preserves_fp32_reference_and_existing_contents(atomic, 
         cce_backward_kernel(**kwargs, classifier_grad_sink=sink)
 
 
-@pytest.mark.parametrize("atomic", [False, True])
-def test_classifier_sink_autograd_does_not_return_a_second_classifier_gradient(atomic):
+def test_classifier_sink_autograd_does_not_return_a_second_classifier_gradient():
     torch.manual_seed(1041)
     e = torch.randn(129, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     c = torch.randn(257, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -87,7 +85,6 @@ def test_classifier_sink_autograd_does_not_return_a_second_classifier_gradient(a
         return_lse=True,
         vocab_ordering=torch.arange(c.shape[0], device="cuda", dtype=torch.int32),
         classifier_grad_sink=sink,
-        classifier_sink_atomic=atomic,
     )
     first = None
     for count in (1, 2):

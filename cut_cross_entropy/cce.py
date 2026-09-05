@@ -58,10 +58,6 @@ class CCEParams:
     # It is owned by the caller and deliberately not saved as a version-checked
     # tensor because several sequential backwards may share one accumulator.
     classifier_grad_sink: torch.Tensor | None = None
-    classifier_sink_atomic: bool = False
-    # Stripe vocabulary tiles over separate embedding-gradient accumulators,
-    # then reduce them once in FP32. One retains the original accumulation.
-    e_grad_partitions: int = 1
 
 
 def _check_vocab_ordering(
@@ -326,8 +322,6 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             pg=pg,
             target_tile=target_tile,
             classifier_grad_sink=params.classifier_grad_sink,
-            classifier_sink_atomic=params.classifier_sink_atomic,
-            e_grad_partitions=params.e_grad_partitions,
         )
 
         return de, dc, dbias, None

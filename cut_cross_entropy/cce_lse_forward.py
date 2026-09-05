@@ -18,7 +18,6 @@ def _cce_lse_forward_kernel(
     NegCorrectLogit,
     RowMax,
     TargetTile,
-    LSEPartials,
     Locks,
     Valids,
     Targets,
@@ -52,7 +51,6 @@ def _cce_lse_forward_kernel(
     HAS_SHIFT: tl.constexpr,
     HAS_ROWMAX: tl.constexpr,
     HAS_VOCAB_ORDERING: tl.constexpr,
-    HAS_LSE_PARTIALS: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_b = tl.cdiv(B, BLOCK_B)
@@ -167,23 +165,20 @@ def _cce_lse_forward_kernel(
 
     o_mask = offs_b < B
 
-    if HAS_LSE_PARTIALS:
-        # Each tile owns its partial. A second kernel reduces across the
-        # vocabulary without serializing thousands of GEMM CTAs on row locks.
-        tl.store(LSEPartials + pid_v * B + offs_b, this_lse, mask=o_mask)
-    else:
-        lse_ptrs = LSE + offs_b
+    lse_ptrs = LSE + offs_b
 
-        this_locks = Locks + (pid_b // tl.cdiv(B, BLOCK_B * num_locks))
-        while tl.atomic_cas(this_locks, 0, 1) == 1:
-            pass
+    this_locks = Locks + (pid_b // tl.cdiv(B, BLOCK_B * num_locks))
+    while tl.atomic_cas(this_locks, 0, 1) == 1:
+        pass
 
-        lse = tl.load(lse_ptrs, mask=o_mask, other=0.0, eviction_policy="evict_last")
-        lse = tl_logaddexp(lse, this_lse)
-        lse = tl.store(lse_ptrs, lse, mask=o_mask, eviction_policy="evict_last")
+    lse = tl.load(lse_ptrs, mask=o_mask, other=0.0, eviction_policy="evict_last")
+    # Keep nonfinite partials visible: min/max logaddexp can discard NaNs.
+    combined = tl_logaddexp(lse, this_lse)
+    lse = tl.where((lse != lse) | (this_lse != this_lse), float("nan"), combined)
+    lse = tl.store(lse_ptrs, lse, mask=o_mask, eviction_policy="evict_last")
 
-        tl.debug_barrier()
-        tl.atomic_xchg(this_locks, 0)
+    tl.debug_barrier()
+    tl.atomic_xchg(this_locks, 0)
 
 
 _cce_lse_forward_kernel = triton.jit(_cce_lse_forward_kernel)
@@ -202,35 +197,9 @@ _cce_lse_forward_kernel = triton.heuristics(  # type: ignore
         "HAS_SHIFT": lambda args: args["shift"] != 0,
         "HAS_ROWMAX": lambda args: args["RowMax"] is not None,
         "HAS_VOCAB_ORDERING": lambda args: args["VocabOrdering"] is not None,
-        "HAS_LSE_PARTIALS": lambda args: args["LSEPartials"] is not None,
     }
 )(_cce_lse_forward_kernel)
 _cce_lse_forward_kernel = cce_forward_autotune()(_cce_lse_forward_kernel)  # type: ignore
-
-
-@triton.jit
-def _reduce_lse_partials(
-    Partials,
-    LSE,
-    B: tl.constexpr,
-    N_V: tl.constexpr,
-    BLOCK_B: tl.constexpr,
-    BLOCK_V: tl.constexpr,
-):
-    rows = tl.program_id(0) * BLOCK_B + tl.arange(0, BLOCK_B)
-    tiles = tl.arange(0, BLOCK_V)
-    partial = tl.load(
-        Partials + tiles[:, None] * B + rows[None, :],
-        mask=(tiles[:, None] < N_V) & (rows[None, :] < B),
-        other=-float("inf"),
-    )
-    maximum = tl.max(partial, axis=0)
-    result = maximum + tl.log(tl.sum(tl.exp(partial - maximum[None, :]), axis=0))
-    # Explicitly propagate NaNs. The legacy min/max-based locked logaddexp can
-    # hide a NaN partial; the tree must expose nonfinite head activations.
-    any_nan = tl.sum((partial != partial).to(tl.int32), axis=0) > 0
-    result = tl.where(any_nan, float("nan"), result)
-    tl.store(LSE + rows, result, mask=rows < B)
 
 
 @dataclass(slots=True)
@@ -253,14 +222,8 @@ def cce_lse_forward_kernel(
     return_logit_avg: bool = False,
     return_row_max: bool = False,
     vocab_ordering: torch.Tensor | None = None,
-    lse_reduction: str = "auto",
 ) -> LSEReturn:
     """Compute the per-row LSE, and optionally the classifier's mean logit.
-
-    ``lse_reduction`` selects locked tile accumulation (``atomic``) or a
-    separate FP32 reduction of disjoint tile partials (``tree``). ``auto``
-    uses the tree once the fixed grid has at least 32 vocabulary tiles; small
-    and autotuned grids retain the single-launch implementation.
 
     ``vocab_ordering`` is an int32 permutation of the classifier rows; when it
     is given, the vocabulary is tiled in that order.  ``return_row_max`` then
@@ -282,27 +245,15 @@ def cce_lse_forward_kernel(
         assert c.shape[0] == bias.shape[0]
 
     V, D = c.shape
-    if lse_reduction not in ("auto", "atomic", "tree"):
-        raise ValueError(f"Unknown LSE reduction {lse_reduction!r}")
-    block_shape = cce_fixed_block_shape(e.dtype)
-    if lse_reduction == "tree" and block_shape is None:
-        raise ValueError("Tree LSE reduction requires a fixed vocabulary tile size")
-    split_lse = block_shape is not None and (
-        lse_reduction == "tree"
-        or (lse_reduction == "auto" and triton.cdiv(V, block_shape[1]) >= 32)
-    )
     # Allocates output.
-    lse = (
-        e.new_empty((B,), dtype=torch.float32)
-        if split_lse
-        else e.new_full((B,), -torch.inf, dtype=torch.float32)
-    )
+    lse = e.new_full((B,), -torch.inf, dtype=torch.float32)
     neg_correct_logit = e.new_full((B,), 0.0, dtype=torch.float32) if targets is not None else None
     assert lse.stride(0) == 1
 
-    locks = None if split_lse else e.new_full((triton.cdiv(B, 128),), 0, dtype=torch.uint32)
-    lse_partials = (
-        e.new_empty((triton.cdiv(V, block_shape[1]), B), dtype=torch.float32) if split_lse else None
+    locks = e.new_full(
+        (triton.cdiv(B, 128),),
+        0,
+        dtype=torch.uint32,
     )
 
     if return_logit_avg:
@@ -344,7 +295,6 @@ def cce_lse_forward_kernel(
         neg_correct_logit,
         row_max,
         target_tile,
-        lse_partials,
         locks,
         valids,
         targets,
@@ -361,19 +311,8 @@ def cce_lse_forward_kernel(
         c.stride(1),  #
         1 if bias is None else bias.stride(0),
         1 if valids is None else valids.stride(0),
-        num_locks=0 if locks is None else locks.size(0),
+        num_locks=locks.size(0),
         B_BIN=b_bin_fn(B),
     )
-
-    if lse_partials is not None:
-        _reduce_lse_partials[(triton.cdiv(B, 8),)](
-            lse_partials,
-            lse,
-            B,
-            lse_partials.shape[0],
-            BLOCK_B=8,
-            BLOCK_V=triton.next_power_of_2(lse_partials.shape[0]),
-            num_warps=4,
-        )
 
     return LSEReturn(lse, logit_avg, neg_correct_logit, row_max, target_tile)

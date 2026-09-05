@@ -147,8 +147,7 @@ def _cce_backward_kernel(
     COMPUTE_DC: tl.constexpr,
     COMPUTE_DE: tl.constexpr,
     COMPUTE_DBIAS: tl.constexpr,
-    E_GRAD_PARTITIONS: tl.constexpr,
-    CLASSIFIER_SINK_ATOMIC: tl.constexpr,
+    EMBEDDING_ATOMIC: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -338,20 +337,18 @@ def _cce_backward_kernel(
             should_skip_e = False
 
         if not should_skip_e:
-            lock_offset = (pid_b // tl.cdiv(B, BLOCK_B * n_de_locks_0)) * n_de_locks_1
-            # Adjacent vocabulary CTAs are launched together. Stripe them over
-            # different accumulators to relieve their shared row-lock pressure;
-            # contiguous vocabulary partitions would still contend together.
-            e_partition = pid_v % E_GRAD_PARTITIONS
-            lock_offset += e_partition * n_de_locks_0 * n_de_locks_1
-            e_partition_offset = e_partition * BMax * D
+            if EMBEDDING_ATOMIC:
+                de_lock_ptr = None
+            else:
+                lock_offset = (pid_b // tl.cdiv(B, BLOCK_B * n_de_locks_0)) * n_de_locks_1
+                de_lock_ptr = dELocks + lock_offset
 
             _mm_backward(
                 d_accum,
-                dE + e_partition_offset + (offs_b[:, None] * stride_eb),
-                dEC + e_partition_offset + (offs_b[:, None] * stride_eb) if KAHAN_E else None,
+                dE + (offs_b[:, None] * stride_eb),
+                dEC + (offs_b[:, None] * stride_eb) if KAHAN_E else None,
                 offs_b[:, None] < BMax,
-                dELocks + lock_offset,
+                de_lock_ptr,
                 n_de_locks_1,
                 C + offs_v[:, None] * stride_cv,
                 offs_v[:, None] < V,
@@ -362,7 +359,7 @@ def _cce_backward_kernel(
                 MM_BACK_EVEN_D,
                 KAHAN_E,
                 DOT_PRECISION,
-                False,
+                EMBEDDING_ATOMIC,
             )
 
     if COMPUTE_DC:
@@ -372,18 +369,14 @@ def _cce_backward_kernel(
             should_skip_c = False
 
         if not should_skip_c:
-            if CLASSIFIER_SINK_ATOMIC:
-                dc_lock_ptr = None
-            else:
-                lock_offset = (pid_v // tl.cdiv(V, BLOCK_V * n_dc_locks_0)) * n_dc_locks_1
-                dc_lock_ptr = dCLocks + lock_offset
+            lock_offset = (pid_v // tl.cdiv(V, BLOCK_V * n_dc_locks_0)) * n_dc_locks_1
 
             _mm_backward(
                 tl.trans(d_accum),
                 dC + (offs_v[:, None] * stride_cv),
                 dCC + (offs_v[:, None] * stride_cv) if KAHAN_C else None,
                 offs_v[:, None] < V,
-                dc_lock_ptr,
+                dCLocks + lock_offset,
                 n_dc_locks_1,
                 E + (offs_b[:, None] * stride_eb),
                 offs_b[:, None] < BMax,
@@ -394,7 +387,7 @@ def _cce_backward_kernel(
                 MM_BACK_EVEN_D,
                 KAHAN_C,
                 DOT_PRECISION,
-                CLASSIFIER_SINK_ATOMIC,
+                False,
             )
 
 
@@ -434,25 +427,6 @@ _cce_backward_kernel = triton.heuristics(  # type: ignore
 _cce_backward_kernel = cce_backward_autotune()(_cce_backward_kernel)  # type: ignore
 
 
-@triton.jit
-def _reduce_e_partitions(
-    Partials,
-    Output,
-    N: tl.constexpr,
-    PARTITIONS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    partitions = tl.arange(0, PARTITIONS)
-    values = tl.load(
-        Partials + partitions[:, None] * N + offsets[None, :],
-        mask=offsets[None, :] < N,
-        other=0,
-    ).to(tl.float32)
-    total = tl.sum(values, axis=0)
-    tl.store(Output + offsets, total, mask=offsets < N)
-
-
 def cce_backward_kernel(
     do: torch.Tensor,
     dlse: torch.Tensor | None,
@@ -481,8 +455,7 @@ def cce_backward_kernel(
     pg: torch.distributed.ProcessGroup | None = None,
     target_tile: torch.Tensor | None = None,
     classifier_grad_sink: torch.Tensor | None = None,
-    e_grad_partitions: int = 1,
-    classifier_sink_atomic: bool = False,
+    embedding_atomic: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert do.numel() in (e.size(0), 1)
     assert c.size(1) == e.size(1)
@@ -501,29 +474,18 @@ def cce_backward_kernel(
     else:
         can_use_fp32_accum = True
 
-    if e_grad_partitions not in (1, 2, 4, 8, 16):
-        raise ValueError("Embedding-gradient partitions must be 1, 2, 4, 8, or 16")
-    if e_grad_partitions > 1 and (not e.is_contiguous() or not can_use_fp32_accum):
-        raise ValueError(
-            "Embedding-gradient partitions require contiguous inputs and Triton >= 3.2"
-        )
-
     do = do.contiguous()
     lse = lse.contiguous()
 
+    if embedding_atomic and not can_use_fp32_accum:
+        raise ValueError("Atomic embedding gradients require Triton >= 3.2")
+    accum_e_fp32 = accum_e_fp32 or embedding_atomic
     de_dtype = torch.float32 if (accum_e_fp32 and can_use_fp32_accum) else None
-    if not e_info.requires_grad:
-        de = None
-    elif e_grad_partitions == 1:
-        de = torch.zeros_like(e, dtype=de_dtype)
-    else:
-        de = e.new_zeros((e_grad_partitions, *e.shape), dtype=de_dtype or e.dtype)
+    de = torch.zeros_like(e, dtype=de_dtype) if e_info.requires_grad else None
 
     if classifier_grad_sink is not None:
         if cce_fixed_block_shape(e.dtype) is None:
-            raise ValueError(
-                "A classifier gradient sink requires a fixed grid; disable CCE_AUTOTUNE"
-            )
+            raise ValueError("A classifier gradient sink requires a fixed grid; disable CCE_AUTOTUNE")
         if not c_info.requires_grad:
             raise ValueError("A classifier gradient sink requires a differentiable classifier")
         if not can_use_fp32_accum:
@@ -538,8 +500,6 @@ def cce_backward_kernel(
         dc = classifier_grad_sink
         accum_c_fp32 = True
     else:
-        if classifier_sink_atomic:
-            raise ValueError("Atomic classifier accumulation requires a persistent FP32 sink")
         dc_dtype = torch.float32 if (accum_c_fp32 and can_use_fp32_accum) else None
         dc = torch.zeros_like(c, dtype=dc_dtype) if c_info.requires_grad else None
 
@@ -552,7 +512,7 @@ def cce_backward_kernel(
     else:
         dbias = None
 
-    if de is not None and e_grad_partitions == 1:
+    if de is not None:
         assert de.stride() == e.stride()
 
     if dc is not None:
@@ -632,16 +592,14 @@ def cce_backward_kernel(
             assert target_tile.shape == (B,)
 
     nd_locks = triton.cdiv(c.size(1), 64)
-    if de is not None:
-        de_locks = e.new_zeros(
-            (e_grad_partitions, triton.cdiv(B, 128), nd_locks), dtype=torch.int32
-        )
-        de_lock_sizes = de_locks.shape[-2:]
+    if de is not None and not embedding_atomic:
+        de_locks = e.new_zeros((triton.cdiv(B, 128), nd_locks), dtype=torch.int32)
+        de_lock_sizes = de_locks.size()
     else:
         de_locks = None
         de_lock_sizes = (None, None)
 
-    if dc is not None and not classifier_sink_atomic:
+    if dc is not None:
         dc_locks = c.new_zeros((triton.cdiv(c.size(0), 128), nd_locks), dtype=torch.int32)
         dc_lock_sizes = dc_locks.size()
     else:
@@ -688,21 +646,8 @@ def cce_backward_kernel(
         B_BIN=b_bin_fn(B),
         FILTER_E_GRAD=filter_e_grad and de is not None,
         FILTER_C_GRAD=filter_c_grad and dc is not None,
-        E_GRAD_PARTITIONS=e_grad_partitions,
-        CLASSIFIER_SINK_ATOMIC=classifier_sink_atomic,
+        EMBEDDING_ATOMIC=embedding_atomic,
     )
-
-    if de is not None and e_grad_partitions > 1:
-        reduced_de = e.new_empty(e.shape, dtype=e_info.dtype)
-        _reduce_e_partitions[(triton.cdiv(e.numel(), 1024),)](
-            de,
-            reduced_de,
-            e.numel(),
-            PARTITIONS=e_grad_partitions,
-            BLOCK=1024,
-            num_warps=4,
-        )
-        de = reduced_de
 
     if reduce_e_grad and de is not None:
         de = vp_reduce_e_grad(de, pg)
