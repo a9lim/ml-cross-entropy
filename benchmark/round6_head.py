@@ -47,7 +47,22 @@ def main():
     parser.add_argument("--z-coef", type=float, default=1e-4)
     parser.add_argument("--replays", type=int, default=30)
     parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument("--stages", type=int, choices=[2, 3, 4, 5])
+    parser.add_argument("--warps", type=int, choices=[4, 8])
     args = parser.parse_args()
+    if args.stages is not None or args.warps is not None:
+        # Benchmark-only overrides: keep the forward/backward instruction and
+        # tile configurations paired, without changing installed defaults.
+        from cut_cross_entropy.cce_backward import _cce_backward_kernel
+        from cut_cross_entropy.cce_lse_forward import _cce_lse_forward_kernel
+
+        for kernel in (_cce_lse_forward_kernel, _cce_backward_kernel):
+            if not hasattr(kernel, "values"):
+                raise RuntimeError("Paired overrides require CCE_AUTOTUNE=0")
+            if args.stages is not None:
+                kernel.values["num_stages"] = lambda _, value=args.stages: value
+            if args.warps is not None:
+                kernel.values["num_warps"] = lambda _, value=args.warps: value
     torch.set_float32_matmul_precision("high")
     torch.manual_seed(1011)
     if args.input:
@@ -71,6 +86,8 @@ def main():
                 "shape": [e.shape[0], c.shape[0], e.shape[1]],
                 "gpu": torch.cuda.get_device_name(),
                 "z_coef": args.z_coef,
+                "stages_override": args.stages,
+                "warps_override": args.warps,
                 "note": "baseline disables metadata reads but retains new forward metadata writes",
             }
         ),
