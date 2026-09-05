@@ -16,13 +16,7 @@ from cut_cross_entropy.cce_backward import cce_backward_kernel
 from cut_cross_entropy.cce_lse_forward import cce_lse_forward_kernel
 from cut_cross_entropy.utils import TensorInfo, _handle_eps
 
-MODES = {
-    "baseline": (False, False, False),
-    "metadata": (True, False, False),
-    "sink": (True, True, False),
-    "e-atomic": (True, False, True),
-    "sink-e-atomic": (True, True, True),
-}
+MODES = {"baseline": False, "metadata": True}
 
 
 def difference(a, b):
@@ -132,7 +126,7 @@ def main():
     )
 
     def run(mode):
-        use_metadata, use_sink, embedding_atomic = MODES[mode]
+        use_metadata = MODES[mode]
         sink = torch.zeros(c.shape, device="cuda", dtype=torch.float32)
         scalar = torch.ones((), device="cuda")
         z_coef = torch.tensor(args.z_coef, device="cuda")
@@ -174,11 +168,8 @@ def main():
                 neg_correct_logit=ret.neg_correct_logit,
                 target_tile=ret.target_tile if use_metadata else None,
                 grad_scale=1 / e.shape[0],
-                classifier_grad_sink=sink if use_sink else None,
-                embedding_atomic=embedding_atomic,
             )
-            if not use_sink:
-                sink.add_(dc)
+            sink.add_(dc)
             return ce, z, de
 
         stream = torch.cuda.Stream()
@@ -259,8 +250,6 @@ def main():
             target_tile=ret.target_tile if use_metadata else None,
             tile_flags=flags,
             grad_scale=1 / e.shape[0],
-            classifier_grad_sink=sink if use_sink else None,
-            embedding_atomic=embedding_atomic,
         )
         result = {
             "mode": mode,
@@ -302,7 +291,9 @@ def main():
         else:
             result["dE_vs_first"] = difference(de, reference[0])
             result["dC_vs_first"] = difference(dc, reference[1])
-        if reference_mask is not None and reference_mask.shape == tile_mask.shape:
+        if reference_mask is None:
+            reference_mask = tile_mask
+        if reference_mask.shape == tile_mask.shape:
             result["same_filter_mask_as_reference"] = bool(torch.equal(tile_mask, reference_mask))
         print(json.dumps(result), flush=True)
         del de, dc
