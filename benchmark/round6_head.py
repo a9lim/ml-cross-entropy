@@ -74,20 +74,38 @@ def main():
     parser.add_argument("--warmup-replays", type=int, default=20)
     parser.add_argument("--stages", type=int, choices=[2, 3, 4, 5])
     parser.add_argument("--warps", type=int, choices=[4, 8])
+    parser.add_argument("--block-b", type=int, choices=[32, 64, 128])
+    parser.add_argument("--block-v", type=int, choices=[32, 64, 128, 256])
+    parser.add_argument("--reference-gradients")
+    parser.add_argument("--save-gradients")
     args = parser.parse_args()
-    if args.stages is not None or args.warps is not None:
+    if any(value is not None for value in (args.stages, args.warps, args.block_b, args.block_v)):
         # Benchmark-only overrides: keep the forward/backward instruction and
         # tile configurations paired, without changing installed defaults.
+        from cut_cross_entropy import tl_autotune
         from cut_cross_entropy.cce_backward import _cce_backward_kernel
         from cut_cross_entropy.cce_lse_forward import _cce_lse_forward_kernel
+
+        config = tl_autotune._cce_best_config()
+        block = dict(config.kwargs)
+        if args.block_b is not None:
+            block["BLOCK_B"] = args.block_b
+        if args.block_v is not None:
+            block["BLOCK_V"] = args.block_v
+        config = type(config)(
+            block,
+            num_warps=args.warps or config.num_warps,
+            num_stages=args.stages or config.num_stages,
+        )
+        # Forward metadata and backward validation must see exactly the same
+        # tile geometry as both compiled kernels, not the installed defaults.
+        tl_autotune._cce_best_config = lambda: config
 
         for kernel in (_cce_lse_forward_kernel, _cce_backward_kernel):
             if not hasattr(kernel, "values"):
                 raise RuntimeError("Paired overrides require CCE_AUTOTUNE=0")
-            if args.stages is not None:
-                kernel.values["num_stages"] = lambda _, value=args.stages: value
-            if args.warps is not None:
-                kernel.values["num_warps"] = lambda _, value=args.warps: value
+            for key, value in config.all_kwargs().items():
+                kernel.values[key] = lambda _, value=value: value
     torch.set_float32_matmul_precision("high")
     torch.manual_seed(1011)
     if args.input:
@@ -113,6 +131,8 @@ def main():
                 "z_coef": args.z_coef,
                 "stages_override": args.stages,
                 "warps_override": args.warps,
+                "block_b_override": args.block_b,
+                "block_v_override": args.block_v,
                 "note": "baseline disables metadata reads but retains new forward metadata writes",
             }
         ),
@@ -203,6 +223,57 @@ def main():
         torch.cuda.synchronize()
         de = outputs[2].float().cpu()
         dc = sink.cpu()
+        # Diagnose the changed tile filter outside timing. Every token/vocab
+        # pair belongs to one tile; tile counts alone are not comparable across
+        # geometries, so report the kept fraction and grid as well.
+        from cut_cross_entropy.tl_autotune import cce_fixed_block_shape
+
+        bb, bv = cce_fixed_block_shape(e.dtype)
+        flags = torch.empty(
+            ((e.shape[0] + bb - 1) // bb, (c.shape[0] + bv - 1) // bv),
+            device="cuda",
+            dtype=torch.int32,
+        )
+        mean = e.float().mean(0, keepdim=True)
+        averages = torch.addmm(
+            torch.zeros(1, c.shape[0], device="cuda"),
+            mean.to(c.dtype),
+            c.mT,
+            out_dtype=torch.float32,
+        )
+        order = torch.argsort(averages[0], stable=True).to(torch.int32)
+        ret = cce_lse_forward_kernel(
+            e,
+            c,
+            targets=targets,
+            vocab_ordering=order,
+            return_row_max=True,
+            lse_reduction=reduction,
+        )
+        cce_backward_kernel(
+            do=scalar,
+            dlse=2 * z_coef * ret.lse / e.shape[0],
+            e=e,
+            e_info=TensorInfo(e.dtype, True),
+            c=c,
+            c_info=TensorInfo(c.dtype, True),
+            bias=None,
+            bias_info=None,
+            lse=ret.lse,
+            valids=None,
+            softcap=None,
+            filter_eps=_handle_eps("auto", e.dtype),
+            targets=targets,
+            vocab_ordering=order,
+            row_max=ret.row_max,
+            neg_correct_logit=ret.neg_correct_logit,
+            target_tile=ret.target_tile if use_metadata else None,
+            tile_flags=flags,
+            grad_scale=1 / e.shape[0],
+            classifier_grad_sink=sink if use_sink else None,
+            classifier_sink_atomic=mode.startswith("sink-red"),
+            e_grad_partitions=partitions,
+        )
         result = {
             "mode": mode,
             "median_ms": statistics.median(timings),
@@ -218,12 +289,23 @@ def main():
             "finite_dE": bool(torch.isfinite(de).all()),
             "finite_dC": bool(torch.isfinite(dc).all()),
             "compiled_resources_so_far": compiled_resources(),
+            "filter_grid": list(flags.shape),
+            "computed_tiles": int((flags == 1).sum().item()),
+            "computed_tile_fraction": (flags == 1).float().mean().item(),
         }
         return result, de, dc
 
     reference = None
+    if args.reference_gradients:
+        saved = torch.load(args.reference_gradients, map_location="cpu", weights_only=True)
+        reference = saved["dE"], saved["dC"]
+        del saved
+    first_mode = True
     for mode in args.modes.split(","):
         result, de, dc = run(mode)
+        if first_mode and args.save_gradients:
+            torch.save({"dE": de, "dC": dc, "input": metadata, "mode": mode}, args.save_gradients)
+        first_mode = False
         if reference is None:
             reference = de, dc
         else:
