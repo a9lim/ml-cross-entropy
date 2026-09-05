@@ -441,6 +441,7 @@ def cce_backward_kernel(
     reduce_e_grad: bool = False,
     pg: torch.distributed.ProcessGroup | None = None,
     target_tile: torch.Tensor | None = None,
+    classifier_grad_sink: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert do.numel() in (e.size(0), 1)
     assert c.size(1) == e.size(1)
@@ -465,8 +466,23 @@ def cce_backward_kernel(
     de_dtype = torch.float32 if (accum_e_fp32 and can_use_fp32_accum) else None
     de = torch.zeros_like(e, dtype=de_dtype) if e_info.requires_grad else None
 
-    dc_dtype = torch.float32 if (accum_c_fp32 and can_use_fp32_accum) else None
-    dc = torch.zeros_like(c, dtype=dc_dtype) if c_info.requires_grad else None
+    if classifier_grad_sink is not None:
+        if not c_info.requires_grad:
+            raise ValueError("A classifier gradient sink requires a differentiable classifier")
+        if not can_use_fp32_accum:
+            raise ValueError("A classifier gradient sink requires Triton >= 3.2")
+        if (
+            classifier_grad_sink.dtype != torch.float32
+            or classifier_grad_sink.device != c.device
+            or classifier_grad_sink.shape != c.shape
+            or classifier_grad_sink.stride() != c.stride()
+        ):
+            raise ValueError("Classifier gradient sink must be FP32 with classifier device/layout")
+        dc = classifier_grad_sink
+        accum_c_fp32 = True
+    else:
+        dc_dtype = torch.float32 if (accum_c_fp32 and can_use_fp32_accum) else None
+        dc = torch.zeros_like(c, dtype=dc_dtype) if c_info.requires_grad else None
 
     accum_e_fp32 = accum_e_fp32 and de is not None
     accum_c_fp32 = accum_c_fp32 and dc is not None
@@ -620,7 +636,11 @@ def cce_backward_kernel(
         assert bias_info is not None
         dbias = dbias.to(dtype=bias_info.dtype)
 
-    if dc is not None:
+    if classifier_grad_sink is not None:
+        # The caller already owns the accumulated FP32 result. Returning it to
+        # autograd would either narrow it or accumulate the same gradient again.
+        dc = None
+    elif dc is not None:
         dc = dc.to(dtype=c_info.dtype)
 
     if de is not None:

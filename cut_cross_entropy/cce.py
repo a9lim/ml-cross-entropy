@@ -53,6 +53,11 @@ class CCEParams:
     # Diagnostic: False forces the late-filter-only path over the same tile
     # grid, so that a caller can check the two decide identically.
     skip_early: bool = True
+    # Optional persistent FP32 classifier-gradient accumulator. Backward adds
+    # into it without clearing and returns no classifier autograd gradient.
+    # It is owned by the caller and deliberately not saved as a version-checked
+    # tensor because several sequential backwards may share one accumulator.
+    classifier_grad_sink: torch.Tensor | None = None
 
 
 def _check_vocab_ordering(
@@ -102,6 +107,8 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
         params: CCEParams,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         needs_grad = e.requires_grad or c.requires_grad
+        if params.classifier_grad_sink is not None and not c.requires_grad:
+            raise ValueError("A classifier gradient sink requires a differentiable classifier")
         if bias is not None:
             needs_grad = needs_grad or bias.requires_grad
 
@@ -314,6 +321,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             reduce_e_grad=reduce_e_grad,
             pg=pg,
             target_tile=target_tile,
+            classifier_grad_sink=params.classifier_grad_sink,
         )
 
         return de, dc, dbias, None
