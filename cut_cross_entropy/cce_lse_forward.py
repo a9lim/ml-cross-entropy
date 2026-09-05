@@ -226,8 +226,8 @@ def _reduce_lse_partials(
     )
     maximum = tl.max(partial, axis=0)
     result = maximum + tl.log(tl.sum(tl.exp(partial - maximum[None, :]), axis=0))
-    # The atomic logaddexp path propagates any NaN partial. Do not allow a
-    # max reduction's NaN behavior to conceal a nonfinite head activation.
+    # Explicitly propagate NaNs. The legacy min/max-based locked logaddexp can
+    # hide a NaN partial; the tree must expose nonfinite head activations.
     any_nan = tl.sum((partial != partial).to(tl.int32), axis=0) > 0
     result = tl.where(any_nan, float("nan"), result)
     tl.store(LSE + rows, result, mask=rows < B)
