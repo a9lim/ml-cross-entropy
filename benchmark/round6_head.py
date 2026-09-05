@@ -22,6 +22,8 @@ MODES = {
     "tree": ("tree", True, False, 1),
     "sink": ("tree", True, True, 1),
     "sink-atomic": ("atomic", True, True, 1),
+    "sink-red": ("tree", True, True, 1),
+    "sink-red-atomic-lse": ("atomic", True, True, 1),
     "tree-p2": ("tree", True, False, 2),
     "tree-p4": ("tree", True, False, 4),
     "tree-p8": ("tree", True, False, 8),
@@ -35,6 +37,28 @@ def difference(a, b):
     delta = (a - b).norm()
     norm = b.norm().clamp_min(1e-30)
     return {"relative_l2": (delta / norm).item(), "norm_ratio": (a.norm() / norm).item()}
+
+
+def compiled_resources():
+    from cut_cross_entropy.cce_backward import _cce_backward_kernel
+    from cut_cross_entropy.cce_lse_forward import _cce_lse_forward_kernel
+
+    resources = []
+    for fn in (_cce_lse_forward_kernel, _cce_backward_kernel):
+        while not hasattr(fn, "device_caches"):
+            fn = fn.fn
+        for kernel in fn.device_caches[torch.cuda.current_device()][0].values():
+            entry = {
+                "kernel": kernel.name,
+                "registers": kernel.n_regs,
+                "spills": kernel.n_spills,
+                "shared_bytes": kernel.metadata.shared,
+                "warps": kernel.metadata.num_warps,
+                "stages": kernel.metadata.num_stages,
+            }
+            if entry not in resources:
+                resources.append(entry)
+    return resources
 
 
 def main():
@@ -139,6 +163,7 @@ def main():
                 target_tile=ret.target_tile if use_metadata else None,
                 grad_scale=1 / e.shape[0],
                 classifier_grad_sink=sink if use_sink else None,
+                classifier_sink_atomic=mode.startswith("sink-red"),
                 e_grad_partitions=partitions,
             )
             if not use_sink:
@@ -157,6 +182,7 @@ def main():
         # Replay does not allocate through PyTorch, so capture's transient
         # allocations must be included in the allocator peak measurement.
         torch.cuda.reset_peak_memory_stats()
+        before_capture_mib = torch.cuda.memory_allocated() / 2**20
         with torch.cuda.graph(graph, stream=stream):
             outputs = body()
         for _ in range(5):
@@ -183,11 +209,14 @@ def main():
             "ce": outputs[0].item(),
             "z_squared": outputs[1].item(),
             "peak_allocated_mib": peak[0],
+            "allocated_before_capture_mib": before_capture_mib,
+            "capture_peak_delta_mib": peak[0] - before_capture_mib,
             "peak_reserved_mib": peak[1],
             "dE_norm": de.norm().item(),
             "dC_norm": dc.norm().item(),
             "finite_dE": bool(torch.isfinite(de).all()),
             "finite_dC": bool(torch.isfinite(dc).all()),
+            "compiled_resources_so_far": compiled_resources(),
         }
         return result, de, dc
 

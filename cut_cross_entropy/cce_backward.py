@@ -34,6 +34,7 @@ def _mm_backward(
     EVEN_D: tl.constexpr,
     USE_KAHAN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    ATOMIC_ADD: tl.constexpr,
 ):
     d_inds = tl.arange(0, BLOCK_D)[None, :].to(tl.int64)
 
@@ -57,13 +58,18 @@ def _mm_backward(
         else:
             mask = partial_mask_a & (d_inds < (D - d * BLOCK_D))
 
-        lock_offset = d // tl.cdiv(D, BLOCK_D * n_locks)
-        this_da_lock_ptr = da_lock_ptr + lock_offset
-
-        if USE_KAHAN:
-            tl_lock_kahan_sum(da_ptrs, dac_ptrs, da_i, mask, this_da_lock_ptr)
+        if ATOMIC_ADD:
+            # The return value is unused, allowing a hardware reduction atomic
+            # instead of loading the prior FP32 matrix into registers and
+            # serializing the whole tile through a lock.
+            tl.atomic_add(da_ptrs, da_i, mask=mask, sem="relaxed")
         else:
-            tl_lock_add(da_ptrs, da_i, mask, this_da_lock_ptr)
+            lock_offset = d // tl.cdiv(D, BLOCK_D * n_locks)
+            this_da_lock_ptr = da_lock_ptr + lock_offset
+            if USE_KAHAN:
+                tl_lock_kahan_sum(da_ptrs, dac_ptrs, da_i, mask, this_da_lock_ptr)
+            else:
+                tl_lock_add(da_ptrs, da_i, mask, this_da_lock_ptr)
 
         b_ptrs += BLOCK_D * stride_bd
         da_ptrs += BLOCK_D * stride_ad
@@ -142,6 +148,7 @@ def _cce_backward_kernel(
     COMPUTE_DE: tl.constexpr,
     COMPUTE_DBIAS: tl.constexpr,
     E_GRAD_PARTITIONS: tl.constexpr,
+    CLASSIFIER_SINK_ATOMIC: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -355,6 +362,7 @@ def _cce_backward_kernel(
                 MM_BACK_EVEN_D,
                 KAHAN_E,
                 DOT_PRECISION,
+                False,
             )
 
     if COMPUTE_DC:
@@ -364,14 +372,18 @@ def _cce_backward_kernel(
             should_skip_c = False
 
         if not should_skip_c:
-            lock_offset = (pid_v // tl.cdiv(V, BLOCK_V * n_dc_locks_0)) * n_dc_locks_1
+            if CLASSIFIER_SINK_ATOMIC:
+                dc_lock_ptr = None
+            else:
+                lock_offset = (pid_v // tl.cdiv(V, BLOCK_V * n_dc_locks_0)) * n_dc_locks_1
+                dc_lock_ptr = dCLocks + lock_offset
 
             _mm_backward(
                 tl.trans(d_accum),
                 dC + (offs_v[:, None] * stride_cv),
                 dCC + (offs_v[:, None] * stride_cv) if KAHAN_C else None,
                 offs_v[:, None] < V,
-                dCLocks + lock_offset,
+                dc_lock_ptr,
                 n_dc_locks_1,
                 E + (offs_b[:, None] * stride_eb),
                 offs_b[:, None] < BMax,
@@ -382,6 +394,7 @@ def _cce_backward_kernel(
                 MM_BACK_EVEN_D,
                 KAHAN_C,
                 DOT_PRECISION,
+                CLASSIFIER_SINK_ATOMIC,
             )
 
 
@@ -469,6 +482,7 @@ def cce_backward_kernel(
     target_tile: torch.Tensor | None = None,
     classifier_grad_sink: torch.Tensor | None = None,
     e_grad_partitions: int = 1,
+    classifier_sink_atomic: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert do.numel() in (e.size(0), 1)
     assert c.size(1) == e.size(1)
@@ -506,6 +520,10 @@ def cce_backward_kernel(
         de = e.new_zeros((e_grad_partitions, *e.shape), dtype=de_dtype or e.dtype)
 
     if classifier_grad_sink is not None:
+        if cce_fixed_block_shape(e.dtype) is None:
+            raise ValueError(
+                "A classifier gradient sink requires a fixed grid; disable CCE_AUTOTUNE"
+            )
         if not c_info.requires_grad:
             raise ValueError("A classifier gradient sink requires a differentiable classifier")
         if not can_use_fp32_accum:
@@ -520,6 +538,8 @@ def cce_backward_kernel(
         dc = classifier_grad_sink
         accum_c_fp32 = True
     else:
+        if classifier_sink_atomic:
+            raise ValueError("Atomic classifier accumulation requires a persistent FP32 sink")
         dc_dtype = torch.float32 if (accum_c_fp32 and can_use_fp32_accum) else None
         dc = torch.zeros_like(c, dtype=dc_dtype) if c_info.requires_grad else None
 
@@ -621,7 +641,7 @@ def cce_backward_kernel(
         de_locks = None
         de_lock_sizes = (None, None)
 
-    if dc is not None:
+    if dc is not None and not classifier_sink_atomic:
         dc_locks = c.new_zeros((triton.cdiv(c.size(0), 128), nd_locks), dtype=torch.int32)
         dc_lock_sizes = dc_locks.size()
     else:
@@ -669,6 +689,7 @@ def cce_backward_kernel(
         FILTER_E_GRAD=filter_e_grad and de is not None,
         FILTER_C_GRAD=filter_c_grad and dc is not None,
         E_GRAD_PARTITIONS=e_grad_partitions,
+        CLASSIFIER_SINK_ATOMIC=classifier_sink_atomic,
     )
 
     if de is not None and e_grad_partitions > 1:
