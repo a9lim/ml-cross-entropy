@@ -141,6 +141,7 @@ def _cce_backward_kernel(
     COMPUTE_DC: tl.constexpr,
     COMPUTE_DE: tl.constexpr,
     COMPUTE_DBIAS: tl.constexpr,
+    E_GRAD_PARTITIONS: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -331,11 +332,17 @@ def _cce_backward_kernel(
 
         if not should_skip_e:
             lock_offset = (pid_b // tl.cdiv(B, BLOCK_B * n_de_locks_0)) * n_de_locks_1
+            # Adjacent vocabulary CTAs are launched together. Stripe them over
+            # different accumulators to relieve their shared row-lock pressure;
+            # contiguous vocabulary partitions would still contend together.
+            e_partition = pid_v % E_GRAD_PARTITIONS
+            lock_offset += e_partition * n_de_locks_0 * n_de_locks_1
+            e_partition_offset = e_partition * BMax * D
 
             _mm_backward(
                 d_accum,
-                dE + (offs_b[:, None] * stride_eb),
-                dEC + (offs_b[:, None] * stride_eb) if KAHAN_E else None,
+                dE + e_partition_offset + (offs_b[:, None] * stride_eb),
+                dEC + e_partition_offset + (offs_b[:, None] * stride_eb) if KAHAN_E else None,
                 offs_b[:, None] < BMax,
                 dELocks + lock_offset,
                 n_de_locks_1,
@@ -414,6 +421,25 @@ _cce_backward_kernel = triton.heuristics(  # type: ignore
 _cce_backward_kernel = cce_backward_autotune()(_cce_backward_kernel)  # type: ignore
 
 
+@triton.jit
+def _reduce_e_partitions(
+    Partials,
+    Output,
+    N: tl.constexpr,
+    PARTITIONS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    partitions = tl.arange(0, PARTITIONS)
+    values = tl.load(
+        Partials + partitions[:, None] * N + offsets[None, :],
+        mask=offsets[None, :] < N,
+        other=0,
+    ).to(tl.float32)
+    total = tl.sum(values, axis=0)
+    tl.store(Output + offsets, total, mask=offsets < N)
+
+
 def cce_backward_kernel(
     do: torch.Tensor,
     dlse: torch.Tensor | None,
@@ -442,6 +468,7 @@ def cce_backward_kernel(
     pg: torch.distributed.ProcessGroup | None = None,
     target_tile: torch.Tensor | None = None,
     classifier_grad_sink: torch.Tensor | None = None,
+    e_grad_partitions: int = 1,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert do.numel() in (e.size(0), 1)
     assert c.size(1) == e.size(1)
@@ -460,11 +487,23 @@ def cce_backward_kernel(
     else:
         can_use_fp32_accum = True
 
+    if e_grad_partitions not in (1, 2, 4, 8, 16):
+        raise ValueError("Embedding-gradient partitions must be 1, 2, 4, 8, or 16")
+    if e_grad_partitions > 1 and (not e.is_contiguous() or not can_use_fp32_accum):
+        raise ValueError(
+            "Embedding-gradient partitions require contiguous inputs and Triton >= 3.2"
+        )
+
     do = do.contiguous()
     lse = lse.contiguous()
 
     de_dtype = torch.float32 if (accum_e_fp32 and can_use_fp32_accum) else None
-    de = torch.zeros_like(e, dtype=de_dtype) if e_info.requires_grad else None
+    if not e_info.requires_grad:
+        de = None
+    elif e_grad_partitions == 1:
+        de = torch.zeros_like(e, dtype=de_dtype)
+    else:
+        de = e.new_zeros((e_grad_partitions, *e.shape), dtype=de_dtype or e.dtype)
 
     if classifier_grad_sink is not None:
         if not c_info.requires_grad:
@@ -493,7 +532,7 @@ def cce_backward_kernel(
     else:
         dbias = None
 
-    if de is not None:
+    if de is not None and e_grad_partitions == 1:
         assert de.stride() == e.stride()
 
     if dc is not None:
@@ -574,8 +613,10 @@ def cce_backward_kernel(
 
     nd_locks = triton.cdiv(c.size(1), 64)
     if de is not None:
-        de_locks = e.new_zeros((triton.cdiv(B, 128), nd_locks), dtype=torch.int32)
-        de_lock_sizes = de_locks.size()
+        de_locks = e.new_zeros(
+            (e_grad_partitions, triton.cdiv(B, 128), nd_locks), dtype=torch.int32
+        )
+        de_lock_sizes = de_locks.shape[-2:]
     else:
         de_locks = None
         de_lock_sizes = (None, None)
@@ -627,7 +668,20 @@ def cce_backward_kernel(
         B_BIN=b_bin_fn(B),
         FILTER_E_GRAD=filter_e_grad and de is not None,
         FILTER_C_GRAD=filter_c_grad and dc is not None,
+        E_GRAD_PARTITIONS=e_grad_partitions,
     )
+
+    if de is not None and e_grad_partitions > 1:
+        reduced_de = e.new_empty(e.shape, dtype=e_info.dtype)
+        _reduce_e_partitions[(triton.cdiv(e.numel(), 1024),)](
+            de,
+            reduced_de,
+            e.numel(),
+            PARTITIONS=e_grad_partitions,
+            BLOCK=1024,
+            num_warps=4,
+        )
+        de = reduced_de
 
     if reduce_e_grad and de is not None:
         de = vp_reduce_e_grad(de, pg)

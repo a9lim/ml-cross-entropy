@@ -17,11 +17,17 @@ from cut_cross_entropy.cce_lse_forward import cce_lse_forward_kernel
 from cut_cross_entropy.utils import TensorInfo, _handle_eps
 
 MODES = {
-    "baseline": ("atomic", False, False),
-    "metadata": ("atomic", True, False),
-    "tree": ("tree", True, False),
-    "sink": ("tree", True, True),
-    "sink-atomic": ("atomic", True, True),
+    "baseline": ("atomic", False, False, 1),
+    "metadata": ("atomic", True, False, 1),
+    "tree": ("tree", True, False, 1),
+    "sink": ("tree", True, True, 1),
+    "sink-atomic": ("atomic", True, True, 1),
+    "tree-p2": ("tree", True, False, 2),
+    "tree-p4": ("tree", True, False, 4),
+    "tree-p8": ("tree", True, False, 8),
+    "sink-p2": ("tree", True, True, 2),
+    "sink-p4": ("tree", True, True, 4),
+    "sink-p8": ("tree", True, True, 8),
 }
 
 
@@ -72,7 +78,7 @@ def main():
     )
 
     def run(mode):
-        reduction, use_metadata, use_sink = MODES[mode]
+        reduction, use_metadata, use_sink, partitions = MODES[mode]
         sink = torch.zeros(c.shape, device="cuda", dtype=torch.float32)
         scalar = torch.ones((), device="cuda")
         z_coef = torch.tensor(args.z_coef, device="cuda")
@@ -116,6 +122,7 @@ def main():
                 target_tile=ret.target_tile if use_metadata else None,
                 grad_scale=1 / e.shape[0],
                 classifier_grad_sink=sink if use_sink else None,
+                e_grad_partitions=partitions,
             )
             if not use_sink:
                 sink.add_(dc)
