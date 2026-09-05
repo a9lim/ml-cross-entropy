@@ -71,6 +71,7 @@ def main():
     parser.add_argument("--z-coef", type=float, default=1e-4)
     parser.add_argument("--replays", type=int, default=30)
     parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument("--warmup-replays", type=int, default=20)
     parser.add_argument("--stages", type=int, choices=[2, 3, 4, 5])
     parser.add_argument("--warps", type=int, choices=[4, 8])
     args = parser.parse_args()
@@ -185,7 +186,7 @@ def main():
         before_capture_mib = torch.cuda.memory_allocated() / 2**20
         with torch.cuda.graph(graph, stream=stream):
             outputs = body()
-        for _ in range(5):
+        for _ in range(args.warmup_replays):
             graph.replay()
         timings = []
         for _ in range(args.rounds):
