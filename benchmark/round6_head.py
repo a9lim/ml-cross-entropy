@@ -154,9 +154,11 @@ def main():
         torch.cuda.synchronize()
         sink.zero_()
         graph = torch.cuda.CUDAGraph()
+        # Replay does not allocate through PyTorch, so capture's transient
+        # allocations must be included in the allocator peak measurement.
+        torch.cuda.reset_peak_memory_stats()
         with torch.cuda.graph(graph, stream=stream):
             outputs = body()
-        torch.cuda.reset_peak_memory_stats()
         for _ in range(5):
             graph.replay()
         timings = []
