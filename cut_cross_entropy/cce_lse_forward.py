@@ -171,20 +171,19 @@ def _cce_lse_forward_kernel(
         # Each tile owns its partial. A second kernel reduces across the
         # vocabulary without serializing thousands of GEMM CTAs on row locks.
         tl.store(LSEPartials + pid_v * B + offs_b, this_lse, mask=o_mask)
-        return
+    else:
+        lse_ptrs = LSE + offs_b
 
-    lse_ptrs = LSE + offs_b
+        this_locks = Locks + (pid_b // tl.cdiv(B, BLOCK_B * num_locks))
+        while tl.atomic_cas(this_locks, 0, 1) == 1:
+            pass
 
-    this_locks = Locks + (pid_b // tl.cdiv(B, BLOCK_B * num_locks))
-    while tl.atomic_cas(this_locks, 0, 1) == 1:
-        pass
+        lse = tl.load(lse_ptrs, mask=o_mask, other=0.0, eviction_policy="evict_last")
+        lse = tl_logaddexp(lse, this_lse)
+        lse = tl.store(lse_ptrs, lse, mask=o_mask, eviction_policy="evict_last")
 
-    lse = tl.load(lse_ptrs, mask=o_mask, other=0.0, eviction_policy="evict_last")
-    lse = tl_logaddexp(lse, this_lse)
-    lse = tl.store(lse_ptrs, lse, mask=o_mask, eviction_policy="evict_last")
-
-    tl.debug_barrier()
-    tl.atomic_xchg(this_locks, 0)
+        tl.debug_barrier()
+        tl.atomic_xchg(this_locks, 0)
 
 
 _cce_lse_forward_kernel = triton.jit(_cce_lse_forward_kernel)

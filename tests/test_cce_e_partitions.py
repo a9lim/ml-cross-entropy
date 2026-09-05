@@ -31,9 +31,16 @@ def test_e_partitions_addressing_filter_and_gradient(partitions, selected_rows, 
         return_row_max=True,
     )
     rows = ret.lse.numel()
+    # Forward LSE is compact; backward dLSE is addressed in the original row
+    # space (the public wrapper expands LSE before exposing it to autograd).
+    dlse = torch.zeros(b, device="cuda")
+    if valids is None:
+        dlse.copy_(2e-4 * ret.lse / rows)
+    else:
+        dlse[valids] = 2e-4 * ret.lse / rows
     kwargs = dict(
         do=torch.ones((), device="cuda"),
-        dlse=2e-4 * ret.lse / rows,
+        dlse=dlse,
         e=e,
         e_info=TensorInfo(torch.float32, True),
         c=c,

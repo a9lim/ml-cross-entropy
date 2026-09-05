@@ -47,6 +47,13 @@ def test_target_tile_matches_membership_and_filtered_gradients(
     )
     torch.testing.assert_close(ret.target_tile, expected, rtol=0, atol=0)
     rows = ret.lse.numel()
+    # LSE is compact over valids, but its incoming derivative uses original
+    # shifted row addresses, as the public autograd wrapper returns it.
+    dlse = torch.zeros(b + shift, device="cuda")
+    if valids is None:
+        dlse.copy_(2e-4 * ret.lse / rows)
+    else:
+        dlse[valids + shift] = 2e-4 * ret.lse / rows
     outputs = []
     for mode in ("late", "legacy_early", "metadata_early"):
         flags = torch.empty(
@@ -54,7 +61,7 @@ def test_target_tile_matches_membership_and_filtered_gradients(
         )
         de, dc, _ = cce_backward_kernel(
             do=torch.ones((), device="cuda"),
-            dlse=2e-4 * ret.lse / rows,
+            dlse=dlse,
             e=e,
             e_info=TensorInfo(torch.float32, True),
             c=c,
