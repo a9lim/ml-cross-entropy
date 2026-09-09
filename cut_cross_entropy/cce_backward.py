@@ -441,6 +441,7 @@ def cce_backward_kernel(
     reduce_e_grad: bool = False,
     pg: torch.distributed.ProcessGroup | None = None,
     target_tile: torch.Tensor | None = None,
+    c_grad_accum: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert do.numel() in (e.size(0), 1)
     assert c.size(1) == e.size(1)
@@ -466,7 +467,19 @@ def cce_backward_kernel(
     de = torch.zeros_like(e, dtype=de_dtype) if e_info.requires_grad else None
 
     dc_dtype = torch.float32 if (accum_c_fp32 and can_use_fp32_accum) else None
-    dc = torch.zeros_like(c, dtype=dc_dtype) if c_info.requires_grad else None
+    if c_grad_accum is not None:
+        # A caller-owned accumulator replaces the per-call zero tensor.  The
+        # tile loop's ``tl_lock_add`` always loads, adds and stores, so
+        # whatever the buffer already holds is accumulated onto; nothing here
+        # zeroes it and no first writer initializes it.
+        assert c_info.requires_grad, "c_grad_accum requires the classifier's gradient"
+        assert dc_dtype is None, "c_grad_accum carries the classifier's own dtype"
+        assert c_grad_accum.shape == c.shape
+        assert c_grad_accum.dtype == c.dtype
+        assert c_grad_accum.device == c.device
+        dc = c_grad_accum
+    else:
+        dc = torch.zeros_like(c, dtype=dc_dtype) if c_info.requires_grad else None
 
     accum_e_fp32 = accum_e_fp32 and de is not None
     accum_c_fp32 = accum_c_fp32 and dc is not None
@@ -620,7 +633,10 @@ def cce_backward_kernel(
         assert bias_info is not None
         dbias = dbias.to(dtype=bias_info.dtype)
 
-    if dc is not None:
+    if c_grad_accum is not None:
+        # The gradient landed in the caller's buffer; autograd gets nothing.
+        dc = None
+    elif dc is not None:
         dc = dc.to(dtype=c_info.dtype)
 
     if de is not None:

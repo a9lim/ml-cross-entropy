@@ -50,6 +50,24 @@ class CCEParams:
     # Optional int32 [n_b_tiles, n_v_tiles] debug output: 1 computed, 0 skipped
     # before the recompute, 2 skipped by the filter after it.
     tile_flags: torch.Tensor | None = None
+    ## Caller-owned classifier gradient accumulator.
+    # A [V, D] buffer in the classifier's dtype and layout that the backward
+    # accumulates its lock-added dC contributions into, in place of the fresh
+    # zero tensor it would otherwise allocate and return.  The buffer is never
+    # zeroed here: consecutive calls accumulate into it, and the caller flushes
+    # and clears it on its own cadence.  The classifier then receives no
+    # autograd gradient, and the tile logic, the vocabulary ordering, and the
+    # row addressing are unchanged -- rows are addressed by original id either
+    # way.  Requires ``accum_c_fp32=False``, the fixed block shape, and no
+    # vocab parallelism.
+    #
+    # Two caller obligations the checks cannot see.  The classifier operand
+    # should have no autograd edge of its own: autograd materializes the None
+    # this backward returns into a full [V, D] zero for whatever node produced
+    # the operand, which is the allocation the buffer exists to remove.  And
+    # the buffer only asks for dC to be *computed*: something upstream still
+    # has to require grad, or the loss carries no graph and no backward runs.
+    c_grad_accum: torch.Tensor | None = None
     # Diagnostic: False forces the late-filter-only path over the same tile
     # grid, so that a caller can check the two decide identically.
     skip_early: bool = True
@@ -86,6 +104,62 @@ def _check_vocab_ordering(
         )
 
 
+def _check_c_grad_accum(
+    c_grad_accum: torch.Tensor, e: torch.Tensor, c: torch.Tensor, params: "CCEParams"
+) -> None:
+    """Validate the caller's classifier gradient buffer against the operands.
+
+    The backward hands the buffer straight to the kernel as ``dC``, so it has
+    to match the shape, dtype, device and layout of the classifier the kernel
+    actually reads -- under autocast that is the cast operand, not the caller's
+    tensor -- and nothing here casts or reshapes it.  It must also be plain
+    storage of its own: a buffer that aliased ``e`` or ``c`` would have the
+    kernel overwrite an operand it is still reading, and one carrying autograd
+    history would be mutated behind a graph that expects to read it back.
+    """
+    if c_grad_accum.requires_grad or c_grad_accum.grad_fn is not None:
+        raise ValueError(
+            "c_grad_accum must not carry autograd history: the kernel writes it in "
+            "place and nothing here bumps its version counter."
+        )
+    for name, operand in (("e", e), ("c", c)):
+        if c_grad_accum.untyped_storage().data_ptr() == operand.untyped_storage().data_ptr():
+            raise ValueError(
+                f"c_grad_accum must not share storage with {name}: the backward writes "
+                "the buffer while it is still reading the operands."
+            )
+    if cce_fixed_block_shape(e.dtype) is None:
+        # The autotuner's reset_to_zero clears dC before each candidate, which
+        # would silently drop whatever the buffer had already accumulated.
+        raise ValueError(
+            "c_grad_accum requires the fixed (non-autotuned) block shape: the "
+            "autotuner zeroes dC between candidate configs. Unset CCE_AUTOTUNE."
+        )
+    if c_grad_accum.shape != c.shape:
+        raise ValueError(
+            f"c_grad_accum must have the classifier's shape {tuple(c.shape)}, "
+            f"got {tuple(c_grad_accum.shape)}."
+        )
+    if c_grad_accum.dtype != c.dtype:
+        raise ValueError(
+            f"c_grad_accum must have the classifier's dtype {c.dtype}, got {c_grad_accum.dtype}."
+        )
+    if c_grad_accum.device != c.device:
+        raise ValueError("c_grad_accum must live on the classifier's device.")
+    if c_grad_accum.stride() != c.stride():
+        raise ValueError("c_grad_accum must have the classifier's layout.")
+    if params.accum_c_fp32:
+        raise ValueError(
+            "c_grad_accum carries the classifier's own dtype, so it is incompatible with "
+            "accum_c_fp32."
+        )
+    if params.vocab_parallel_options is not None:
+        raise ValueError(
+            "c_grad_accum is not supported with vocab parallelism: each rank holds only a "
+            "slice of the classifier."
+        )
+
+
 @torch.compile(fullgraph=True)
 def sort_logit_avg(logit_avg: torch.Tensor) -> torch.Tensor:
     return torch.argsort(logit_avg).to(torch.int32)
@@ -101,7 +175,13 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
         bias: torch.Tensor | None,
         params: CCEParams,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        needs_grad = e.requires_grad or c.requires_grad
+        # A classifier gradient buffer is a request for dC in its own right:
+        # the classifier operand it is paired with need not carry autograd at
+        # all, and every decision the classifier's own ``requires_grad`` drives
+        # -- filtering, the stored row max, the backward's dC half -- follows
+        # this instead.
+        c_needs_grad = c.requires_grad or params.c_grad_accum is not None
+        needs_grad = e.requires_grad or c_needs_grad
         if bias is not None:
             needs_grad = needs_grad or bias.requires_grad
 
@@ -122,14 +202,14 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             and params.filter_e_grad
             and params.filter_c_grad
             and e.requires_grad
-            and c.requires_grad
+            and c_needs_grad
         )
         # A caller-supplied ordering replaces the live one, and the backward's
         # argsort disappears with the mean logit that fed it.
         return_logit_avg = filtering and vocab_ordering is None
 
         e_info = TensorInfo(e.dtype, e.requires_grad)
-        c_info = TensorInfo(c.dtype, c.requires_grad)
+        c_info = TensorInfo(c.dtype, c_needs_grad)
 
         bias_info = None
         if bias is not None:
@@ -141,6 +221,9 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
 
             if bias is not None:
                 bias = bias.to(dtype=torch.get_autocast_gpu_dtype())
+
+        if params.c_grad_accum is not None:
+            _check_c_grad_accum(params.c_grad_accum, e, c, params)
 
         targets = params.targets
         if (vp_opts := params.vocab_parallel_options) is not None:
@@ -314,8 +397,12 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             reduce_e_grad=reduce_e_grad,
             pg=pg,
             target_tile=target_tile,
+            c_grad_accum=params.c_grad_accum,
         )
 
+        # With a caller-owned accumulator the kernel has already added this
+        # call's dC into it, and ``dc`` comes back None: the classifier gets no
+        # autograd gradient at all.
         return de, dc, dbias, None
 
 
