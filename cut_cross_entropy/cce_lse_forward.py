@@ -12,6 +12,8 @@ from cut_cross_entropy.tl_utils import b_bin_fn, tl_logaddexp, tl_softcapping
 def _cce_lse_forward_kernel(
     E,
     C,
+    EScale,
+    CScale,
     Bias,
     LSE,
     LA,
@@ -51,6 +53,7 @@ def _cce_lse_forward_kernel(
     HAS_SHIFT: tl.constexpr,
     HAS_ROWMAX: tl.constexpr,
     HAS_VOCAB_ORDERING: tl.constexpr,
+    FP8: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_b = tl.cdiv(B, BLOCK_B)
@@ -88,14 +91,24 @@ def _cce_lse_forward_kernel(
 
         c = tl.load(c_ptrs, mask=c_mask, other=0.0)
 
-        accum = tl.dot(e, c, accum, input_precision=DOT_PRECISION)
+        if FP8:
+            accum = tl.dot(e, c, accum)
+        else:
+            accum = tl.dot(e, c, accum, input_precision=DOT_PRECISION)
 
         e_ptrs += BLOCK_D * stride_ed
         c_ptrs += BLOCK_D * stride_cd
 
     tl.debug_barrier()
 
-    accum = accum.cast(E.dtype.element_ty, fp_downcast_rounding="rtne")
+    if FP8:
+        # FP8 operands carry one scale per row of E and per row of C; the
+        # logits stay in fp32, and the backward recomputes them the same way.
+        e_scale = tl.load(EScale + offs_b, mask=offs_b < BMax, other=0.0)
+        c_scale = tl.load(CScale + offs_v, mask=offs_v < V, other=0.0)
+        accum = accum * e_scale[:, None] * c_scale[None, :]
+    else:
+        accum = accum.cast(E.dtype.element_ty, fp_downcast_rounding="rtne")
     if HAS_BIAS:
         bias = tl.load(Bias + offs_v * stride_biasv, mask=offs_v < V, other=0.0)
         accum += bias[None, :]
@@ -197,6 +210,7 @@ _cce_lse_forward_kernel = triton.heuristics(  # type: ignore
         "HAS_SHIFT": lambda args: args["shift"] != 0,
         "HAS_ROWMAX": lambda args: args["RowMax"] is not None,
         "HAS_VOCAB_ORDERING": lambda args: args["VocabOrdering"] is not None,
+        "FP8": lambda args: args["E"].dtype == torch.float8_e4m3fn,
     }
 )(_cce_lse_forward_kernel)
 _cce_lse_forward_kernel = cce_forward_autotune()(_cce_lse_forward_kernel)  # type: ignore
@@ -222,6 +236,8 @@ def cce_lse_forward_kernel(
     return_logit_avg: bool = False,
     return_row_max: bool = False,
     vocab_ordering: torch.Tensor | None = None,
+    e_scale: torch.Tensor | None = None,
+    c_scale: torch.Tensor | None = None,
 ) -> LSEReturn:
     """Compute the per-row LSE, and optionally the classifier's mean logit.
 
@@ -230,10 +246,22 @@ def cce_lse_forward_kernel(
     also stores, per (vocab tile, row), the largest logit over that tile's
     non-target columns, which is what lets the backward decide a tile's
     gradient filter before recomputing its logits.
+
+    FP8 ``e`` and ``c`` come with ``e_scale`` ``[B]`` and ``c_scale`` ``[V]``,
+    one fp32 scale per row of each, applied to the fp32 logits.
     """
     # Check constraints.
     assert e.shape[1] == c.shape[1], "Incompatible dimensions"
     assert e.is_contiguous(), "Matrix A must be contiguous"
+    if e.dtype == torch.float8_e4m3fn:
+        assert c.dtype == e.dtype, "FP8 embeddings need an FP8 classifier"
+        assert e_scale is not None and c_scale is not None, "FP8 operands need scales"
+        assert e_scale.shape == (e.shape[0],) and e_scale.dtype == torch.float32
+        assert c_scale.shape == (c.shape[0],) and c_scale.dtype == torch.float32
+        assert e_scale.is_contiguous() and c_scale.is_contiguous()
+        assert softcap is None, "softcap is not supported on FP8 operands"
+    else:
+        assert e_scale is None and c_scale is None, "scales are for FP8 operands"
     if valids is not None:
         assert valids.ndim == 1
         B = valids.numel()
@@ -289,6 +317,8 @@ def cce_lse_forward_kernel(
     _cce_lse_forward_kernel[grid](
         e,
         c,
+        e_scale,
+        c_scale,
         bias,
         lse,
         logit_avg,

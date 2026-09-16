@@ -11,9 +11,13 @@ from cut_cross_entropy.constants import IGNORE_INDEX
 from cut_cross_entropy.doc import CCE_OPTS_DOC, LINEAR_CROSS_ENTROPY_DOC, add_doc_start
 from cut_cross_entropy.tl_autotune import cce_fixed_block_shape
 from cut_cross_entropy.utils import (
+    CCEFp8Classifier,
+    CCEFp8Operands,
     TensorInfo,
     _build_flat_valids,
     _handle_eps,
+    fp8_columns,
+    fp8_rows,
     handle_reduction_none,
 )
 from cut_cross_entropy.vocab_parallel.utils import (
@@ -71,6 +75,18 @@ class CCEParams:
     # Diagnostic: False forces the late-filter-only path over the same tile
     # grid, so that a caller can check the two decide identically.
     skip_early: bool = True
+    ## FP8 recipe.
+    # The classifier in FP8 with per-row scales, both layouts.  With one, the
+    # embeddings are quantized per token row (for the logits) and per feature
+    # column (for the classifier gradient) inside the forward, and every GEMM
+    # of the head runs on FP8 tensor cores with fp32 accumulation: the logits
+    # are scaled fp32 in both halves, the softmax and the filter are
+    # unchanged, and the two backward GEMMs quantize the probability tile in
+    # registers with one scale per row of the tile.  ``c`` is then only the
+    # dtype and layout reference for the accumulator; the kernels never read
+    # it.  Requires the fixed block shape, no bias, no softcap, no vocab
+    # parallelism, and BF16 accumulation flags off.
+    fp8_classifier: CCEFp8Classifier | None = None
 
 
 def _check_vocab_ordering(
@@ -226,6 +242,30 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             if bias is not None:
                 bias = bias.to(dtype=torch.get_autocast_gpu_dtype())
 
+        fp8 = None
+        e_scale = c_scale = None
+        if (classifier := params.fp8_classifier) is not None:
+            if bias is not None or params.softcap is not None:
+                raise ValueError("the FP8 recipe takes no bias and no softcap")
+            if params.vocab_parallel_options is not None:
+                raise ValueError("the FP8 recipe is not supported with vocab parallelism")
+            if params.accum_e_fp32 or params.accum_c_fp32:
+                raise ValueError("the FP8 recipe accumulates in the buffers' own dtypes")
+            if classifier.weight.shape != c.shape:
+                raise ValueError("fp8_classifier must have the classifier's shape")
+            e_fp8, e_scale = fp8_rows(e)
+            e_transposed, e_transposed_scale = fp8_columns(e)
+            fp8 = CCEFp8Operands(
+                e_scale,
+                e_transposed,
+                e_transposed_scale,
+                classifier.scale,
+                classifier.transposed,
+                classifier.transposed_scale,
+            )
+            e, c = e_fp8, classifier.weight
+            c_scale = classifier.scale
+
         if params.c_grad_accum is not None:
             _check_c_grad_accum(params.c_grad_accum, e, c, params)
 
@@ -255,6 +295,8 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             vocab_ordering=vocab_ordering,
             shift=params.shift,
             targets=targets,
+            e_scale=e_scale,
+            c_scale=c_scale,
         )
         lse = ret.lse
         assert ret.neg_correct_logit is not None
@@ -290,6 +332,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
         ctx.e_info = e_info
         ctx.c_info = c_info
         ctx.bias_info = bias_info
+        ctx.fp8 = fp8
 
         if not params.return_lse:
             ret_lse = None
@@ -402,6 +445,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             pg=pg,
             target_tile=target_tile,
             c_grad_accum=params.c_grad_accum,
+            fp8=ctx.fp8,
         )
 
         # With a caller-owned accumulator the kernel has already added this

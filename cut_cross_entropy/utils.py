@@ -16,6 +16,54 @@ def softcapping(logits: torch.Tensor, softcap: float) -> torch.Tensor:
     return torch.tanh(logits / softcap) * softcap
 
 
+@dataclass(frozen=True)
+class CCEFp8Classifier:
+    """A classifier in FP8 for the CCE kernels: ``weight`` ``[V, D]`` with one
+    fp32 scale per vocabulary row, and its transpose ``[D, V]`` with one scale
+    per feature row, so the logits and the embedding gradient each read an
+    operand contiguous along their reduction."""
+
+    weight: torch.Tensor
+    scale: torch.Tensor
+    transposed: torch.Tensor
+    transposed_scale: torch.Tensor
+
+
+@dataclass(frozen=True)
+class CCEFp8Operands:
+    """Everything the FP8 backward reads beside the FP8 ``e`` and ``c``."""
+
+    e_scale: torch.Tensor
+    e_transposed: torch.Tensor
+    e_transposed_scale: torch.Tensor
+    c_scale: torch.Tensor
+    c_transposed: torch.Tensor
+    c_transposed_scale: torch.Tensor
+
+
+FP8_DTYPE = torch.float8_e4m3fn
+FP8_MAX = torch.finfo(FP8_DTYPE).max
+FP8_SCALE_FLOOR = 2.0**-64
+
+
+@torch.compile(fullgraph=True, dynamic=False)
+def fp8_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``x`` ``[B, D]`` in FP8 with one fp32 scale per row: ``x ~ q * scale``."""
+    amax = x.detach().abs().amax(dim=1).float()
+    scale = (amax * (1.0 / FP8_MAX)).clamp_min(FP8_SCALE_FLOOR)
+    q = (x.float() / scale[:, None]).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
+    return q, scale
+
+
+@torch.compile(fullgraph=True, dynamic=False)
+def fp8_columns(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``x^T`` ``[D, B]`` in FP8 with one fp32 scale per column of ``x``."""
+    amax = x.detach().abs().amax(dim=0).float()
+    scale = (amax * (1.0 / FP8_MAX)).clamp_min(FP8_SCALE_FLOOR)
+    q = (x.float() / scale[None, :]).clamp(-FP8_MAX, FP8_MAX).t().contiguous().to(FP8_DTYPE)
+    return q, scale
+
+
 def _handle_eps(filter_eps: float | str | None, dtype: torch.dtype) -> float | None:
     if filter_eps is None:
         return None

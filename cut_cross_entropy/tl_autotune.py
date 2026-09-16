@@ -454,31 +454,31 @@ def get_autotune_config():
 
 
 def _heuristics_from_config(
-    config: Config, fp32_config: Config | None = None, arg_name: str | None = None
+    config: Config,
+    fp32_config: Config | None = None,
+    arg_name: str | None = None,
+    fp8_config: Config | None = None,
 ) -> Callable[..., autotuner.Heuristics]:
-    if fp32_config is None:
+    """The fixed configuration as heuristics, selected by ``arg_name``'s dtype."""
+    if fp32_config is None and fp8_config is None:
         return triton.heuristics(
             {k: (lambda args, _v=v: _v) for k, v in config.all_kwargs().items()}
         )
-    else:
-        assert arg_name is not None
+    assert arg_name is not None
+    kwargs = config.all_kwargs()
+    by_dtype = {}
+    if fp32_config is not None:
+        by_dtype[torch.float32] = fp32_config.all_kwargs()
+    if fp8_config is not None:
+        by_dtype[torch.float8_e4m3fn] = fp8_config.all_kwargs()
+    assert all(other.keys() == kwargs.keys() for other in by_dtype.values())
 
-        kwargs = config.all_kwargs()
-        fp32_kwargs = fp32_config.all_kwargs()
-        assert kwargs.keys() == fp32_kwargs.keys()
+    def pick(args, key, default):
+        return by_dtype.get(args[arg_name].dtype, kwargs).get(key, default)
 
-        keys_opts = list(kwargs.items())
-        fp32_opts = [fp32_kwargs[k] for k, _ in keys_opts]
-        return triton.heuristics(
-            {
-                k: (
-                    lambda args, _v=v, _fp32_v=fp32_v: _fp32_v
-                    if args[arg_name].dtype == torch.float32
-                    else _v
-                )
-                for (k, v), fp32_v in zip(keys_opts, fp32_opts, strict=True)
-            }
-        )
+    return triton.heuristics(
+        {k: (lambda args, _k=k, _v=v: pick(args, _k, _v)) for k, v in kwargs.items()}
+    )
 
 
 ## NOTE
@@ -494,17 +494,51 @@ def _cce_best_config_fp32() -> Config:
     return Config(dict(BLOCK_B=32, BLOCK_V=128, BLOCK_D=32), num_warps=4, num_stages=3)
 
 
-def cce_fixed_block_shape(e_dtype: torch.dtype) -> tuple[int, int] | None:
+## NOTE
+# The FP8 kernels keep their own configurations, one per half.  The 8-bit
+# MMA fragments and the in-register quantization of the backward's
+# probability tile are register-hungry on sm_89: the BF16 shape spills, and
+# the two halves want different token tiles and warp counts.  Only the
+# vocabulary tile has to agree between them, for the row max and the target
+# tile the forward stores per vocabulary tile; the rest of the backward's
+# state is per row.  Measured on the RTX 4090 at B = 8,192, V = 50,304,
+# D = 768: forward 4.13 ms against 4.08 in BF16, backward 6.48 against 7.45.
+def _cce_best_config_fp8() -> Config:
+    return Config(dict(BLOCK_B=256, BLOCK_V=64, BLOCK_D=64), num_warps=8, num_stages=3)
+
+
+def _cce_best_config_fp8_backward() -> Config:
+    return Config(dict(BLOCK_B=64, BLOCK_V=64, BLOCK_D=32), num_warps=4, num_stages=4)
+
+
+def _fixed_config_for(e_dtype: torch.dtype, backward: bool = False) -> Config:
+    if e_dtype == torch.float32:
+        return _cce_best_config_fp32()
+    if e_dtype == torch.float8_e4m3fn:
+        return _cce_best_config_fp8_backward() if backward else _cce_best_config_fp8()
+    return _cce_best_config()
+
+
+def cce_fixed_block_shape(
+    e_dtype: torch.dtype, backward: bool = False
+) -> tuple[int, int] | None:
     """(BLOCK_B, BLOCK_V) of the fixed config, or None when autotuning.
 
     The exact skip-early needs the forward and the backward to walk the same
-    (token tile, vocab tile) grid, which only the fixed configs guarantee.
+    vocabulary tiling, which only the fixed configs guarantee; the FP8 halves
+    differ in their token tile, so ``backward`` selects that half's.
     """
     if _AUTOTUNE:
         return None
 
-    kwargs = (_cce_best_config_fp32() if e_dtype == torch.float32 else _cce_best_config()).kwargs
+    kwargs = _fixed_config_for(e_dtype, backward).kwargs
     return int(kwargs["BLOCK_B"]), int(kwargs["BLOCK_V"])
+
+
+assert (
+    _cce_best_config_fp8().kwargs["BLOCK_V"]
+    == _cce_best_config_fp8_backward().kwargs["BLOCK_V"]
+), "the FP8 forward and backward must tile the vocabulary alike"
 
 
 def cce_forward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heuristics]:
@@ -521,7 +555,9 @@ def cce_forward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heur
             reset_to_zero=["LA"],
         )
     else:
-        return _heuristics_from_config(_cce_best_config(), _cce_best_config_fp32(), "E")
+        return _heuristics_from_config(
+            _cce_best_config(), _cce_best_config_fp32(), "E", _cce_best_config_fp8()
+        )
 
 
 def _bw_total_ops_fn(B, V, D) -> float:
@@ -551,7 +587,9 @@ def cce_backward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heu
             reset_to_zero=["dE", "dC", "dEC", "dCC", "dBias"],
         )
     else:
-        return _heuristics_from_config(_cce_best_config(), _cce_best_config_fp32(), "E")
+        return _heuristics_from_config(
+            _cce_best_config(), _cce_best_config_fp32(), "E", _cce_best_config_fp8_backward()
+        )
 
 
 def _indexed_dot_best_config() -> Config:

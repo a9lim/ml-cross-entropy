@@ -13,19 +13,21 @@ from cut_cross_entropy.tl_utils import (
     tl_softcapping,
     tl_softcapping_grad,
 )
-from cut_cross_entropy.utils import TensorInfo
+from cut_cross_entropy.utils import CCEFp8Operands, TensorInfo
 from cut_cross_entropy.vocab_parallel.utils import vp_reduce_e_grad
 
 
 @triton.jit
 def _mm_backward(
     do,
+    do_scale,
     da_ptrs,
     dac_ptrs,
     partial_mask_a,
     da_lock_ptr,
     n_locks,
     b_ptrs,
+    b_scale_ptrs,
     partial_mask_b,
     stride_ad,
     stride_bd,
@@ -34,13 +36,22 @@ def _mm_backward(
     EVEN_D: tl.constexpr,
     USE_KAHAN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    FP8: tl.constexpr,
 ):
+    """``da += do @ b`` over the ``D`` axis in ``BLOCK_D`` steps, lock-added.
+
+    Under FP8 ``do`` is an FP8 tile with one fp32 scale per row, and ``b`` the
+    transposed FP8 operand with one fp32 scale per ``D`` row of the transpose
+    (``b_scale_ptrs``), i.e. per output column here, applied to each block.
+    """
     d_inds = tl.arange(0, BLOCK_D)[None, :].to(tl.int64)
 
     b_ptrs = b_ptrs + d_inds * stride_bd
     da_ptrs = da_ptrs + d_inds * stride_ad
     if USE_KAHAN:
         dac_ptrs = dac_ptrs + d_inds * stride_ad
+    if FP8:
+        b_scale_ptrs = b_scale_ptrs + d_inds
 
     for d in range(0, tl.cdiv(D, BLOCK_D)):
         if EVEN_D:
@@ -50,7 +61,18 @@ def _mm_backward(
 
         b = tl.load(b_ptrs, mask=mask, other=0.0)
 
-        da_i = tl.dot(do, b, input_precision=DOT_PRECISION).to(da_ptrs.dtype.element_ty)
+        if FP8:
+            if EVEN_D:
+                column_scale = tl.load(b_scale_ptrs)
+            else:
+                column_scale = tl.load(
+                    b_scale_ptrs, mask=d_inds < (D - d * BLOCK_D), other=0.0
+                )
+            da_i = (tl.dot(do, b) * do_scale[:, None] * column_scale).to(
+                da_ptrs.dtype.element_ty
+            )
+        else:
+            da_i = tl.dot(do, b, input_precision=DOT_PRECISION).to(da_ptrs.dtype.element_ty)
 
         if EVEN_D:
             mask = partial_mask_a
@@ -69,6 +91,8 @@ def _mm_backward(
         da_ptrs += BLOCK_D * stride_ad
         if USE_KAHAN:
             dac_ptrs += BLOCK_D * stride_ad
+        if FP8:
+            b_scale_ptrs += BLOCK_D
 
 
 @triton.jit
@@ -79,6 +103,12 @@ def _block_is_filtered(check_val: tl.tensor, filter_eps: tl.tensor) -> tl.tensor
 def _cce_backward_kernel(
     E,
     C,
+    EScale,
+    CScale,
+    ET,
+    ETScale,
+    CT,
+    CTScale,
     Bias,
     LSE,
     dOut,
@@ -142,6 +172,9 @@ def _cce_backward_kernel(
     COMPUTE_DE: tl.constexpr,
     COMPUTE_DBIAS: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    FP8: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    FP8_SCALE_FLOOR: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_b_chunks = tl.cdiv(B, BLOCK_B)
@@ -234,14 +267,23 @@ def _cce_backward_kernel(
 
         c = tl.load(c_ptrs, mask=c_mask, other=0.0)
 
-        accum = tl.dot(e, c, accum, input_precision=DOT_PRECISION)
+        if FP8:
+            accum = tl.dot(e, c, accum)
+        else:
+            accum = tl.dot(e, c, accum, input_precision=DOT_PRECISION)
 
         e_ptrs += BLOCK_D * stride_ed
         c_ptrs += BLOCK_D * stride_cd
 
     tl.debug_barrier()
 
-    accum = accum.cast(E.dtype.element_ty, fp_downcast_rounding="rtne")
+    if FP8:
+        # The same scaled fp32 logits the forward computed.
+        e_scale = tl.load(EScale + offs_b, mask=offs_b < BMax, other=0.0)
+        c_scale = tl.load(CScale + offs_v, mask=offs_v < V, other=0.0)
+        accum = accum * e_scale[:, None] * c_scale[None, :]
+    else:
+        accum = accum.cast(E.dtype.element_ty, fp_downcast_rounding="rtne")
     if HAS_BIAS:
         bias = tl.load(Bias + offs_v * stride_biasv, mask=offs_v < V, other=0.0)
         accum += bias[None, :]
@@ -321,7 +363,23 @@ def _cce_backward_kernel(
     if COMPUTE_DBIAS:
         tl.atomic_add(dBias + offs_v * stride_biasv, tl.sum(d_accum, 0), mask=offs_v < V)
 
-    d_accum = d_accum.cast(E.dtype.element_ty, fp_downcast_rounding="rtne")
+    if FP8:
+        # Both FP8 operands of the probability tile are made here, before
+        # either GEMM, so the fp32 tile dies at once: P per token row for
+        # dE = P @ C, and P^T per vocabulary row for dC = P^T @ E. Each GEMM
+        # reads the transposed copy of its other operand, contiguous along
+        # the reduction, whose scales are per feature and multiply the
+        # result's columns.
+        de_scale = tl.maximum(tl.max(tl.abs(d_accum), axis=1) / FP8_MAX, FP8_SCALE_FLOOR)
+        de_operand = (d_accum / de_scale[:, None]).to(tl.float8e4nv)
+        if COMPUTE_DC:
+            dc_operand = tl.trans(d_accum)
+            dc_scale = tl.maximum(
+                tl.max(tl.abs(dc_operand), axis=1) / FP8_MAX, FP8_SCALE_FLOOR
+            )
+            dc_operand = (dc_operand / dc_scale[:, None]).to(tl.float8e4nv)
+    else:
+        d_accum = d_accum.cast(E.dtype.element_ty, fp_downcast_rounding="rtne")
 
     if COMPUTE_DE:
         if FILTER_E_GRAD:
@@ -332,23 +390,48 @@ def _cce_backward_kernel(
         if not should_skip_e:
             lock_offset = (pid_b // tl.cdiv(B, BLOCK_B * n_de_locks_0)) * n_de_locks_1
 
-            _mm_backward(
-                d_accum,
-                dE + (offs_b[:, None] * stride_eb),
-                dEC + (offs_b[:, None] * stride_eb) if KAHAN_E else None,
-                offs_b[:, None] < BMax,
-                dELocks + lock_offset,
-                n_de_locks_1,
-                C + offs_v[:, None] * stride_cv,
-                offs_v[:, None] < V,
-                stride_ed,
-                stride_cd,
-                D,
-                MM_BACK_BLOCK_D,
-                MM_BACK_EVEN_D,
-                KAHAN_E,
-                DOT_PRECISION,
-            )
+            if FP8:
+                _mm_backward(
+                    de_operand,
+                    de_scale,
+                    dE + (offs_b[:, None] * stride_eb),
+                    dEC + (offs_b[:, None] * stride_eb) if KAHAN_E else None,
+                    offs_b[:, None] < BMax,
+                    dELocks + lock_offset,
+                    n_de_locks_1,
+                    CT + offs_v[:, None],
+                    CTScale,
+                    offs_v[:, None] < V,
+                    stride_ed,
+                    V,
+                    D,
+                    MM_BACK_BLOCK_D,
+                    MM_BACK_EVEN_D,
+                    KAHAN_E,
+                    DOT_PRECISION,
+                    True,
+                )
+            else:
+                _mm_backward(
+                    d_accum,
+                    None,
+                    dE + (offs_b[:, None] * stride_eb),
+                    dEC + (offs_b[:, None] * stride_eb) if KAHAN_E else None,
+                    offs_b[:, None] < BMax,
+                    dELocks + lock_offset,
+                    n_de_locks_1,
+                    C + offs_v[:, None] * stride_cv,
+                    None,
+                    offs_v[:, None] < V,
+                    stride_ed,
+                    stride_cd,
+                    D,
+                    MM_BACK_BLOCK_D,
+                    MM_BACK_EVEN_D,
+                    KAHAN_E,
+                    DOT_PRECISION,
+                    False,
+                )
 
     if COMPUTE_DC:
         if FILTER_C_GRAD:
@@ -359,23 +442,48 @@ def _cce_backward_kernel(
         if not should_skip_c:
             lock_offset = (pid_v // tl.cdiv(V, BLOCK_V * n_dc_locks_0)) * n_dc_locks_1
 
-            _mm_backward(
-                tl.trans(d_accum),
-                dC + (offs_v[:, None] * stride_cv),
-                dCC + (offs_v[:, None] * stride_cv) if KAHAN_C else None,
-                offs_v[:, None] < V,
-                dCLocks + lock_offset,
-                n_dc_locks_1,
-                E + (offs_b[:, None] * stride_eb),
-                offs_b[:, None] < BMax,
-                stride_cd,
-                stride_ed,
-                D,
-                MM_BACK_BLOCK_D,
-                MM_BACK_EVEN_D,
-                KAHAN_C,
-                DOT_PRECISION,
-            )
+            if FP8:
+                _mm_backward(
+                    dc_operand,
+                    dc_scale,
+                    dC + (offs_v[:, None] * stride_cv),
+                    dCC + (offs_v[:, None] * stride_cv) if KAHAN_C else None,
+                    offs_v[:, None] < V,
+                    dCLocks + lock_offset,
+                    n_dc_locks_1,
+                    ET + offs_b[:, None],
+                    ETScale,
+                    offs_b[:, None] < BMax,
+                    stride_cd,
+                    BMax,
+                    D,
+                    MM_BACK_BLOCK_D,
+                    MM_BACK_EVEN_D,
+                    KAHAN_C,
+                    DOT_PRECISION,
+                    True,
+                )
+            else:
+                _mm_backward(
+                    tl.trans(d_accum),
+                    None,
+                    dC + (offs_v[:, None] * stride_cv),
+                    dCC + (offs_v[:, None] * stride_cv) if KAHAN_C else None,
+                    offs_v[:, None] < V,
+                    dCLocks + lock_offset,
+                    n_dc_locks_1,
+                    E + (offs_b[:, None] * stride_eb),
+                    None,
+                    offs_b[:, None] < BMax,
+                    stride_cd,
+                    stride_ed,
+                    D,
+                    MM_BACK_BLOCK_D,
+                    MM_BACK_EVEN_D,
+                    KAHAN_C,
+                    DOT_PRECISION,
+                    False,
+                )
 
 
 def _cce_back_block_d(args) -> int:
@@ -409,6 +517,9 @@ _cce_backward_kernel = triton.heuristics(  # type: ignore
         "DOT_PRECISION": lambda args: (
             "tf32" if torch.get_float32_matmul_precision() == "high" else "ieee"
         ),
+        "FP8": lambda args: args["E"].dtype == torch.float8_e4m3fn,
+        "FP8_MAX": lambda args: torch.finfo(torch.float8_e4m3fn).max,
+        "FP8_SCALE_FLOOR": lambda args: 2.0**-64,
     }
 )(_cce_backward_kernel)
 _cce_backward_kernel = cce_backward_autotune()(_cce_backward_kernel)  # type: ignore
@@ -442,10 +553,24 @@ def cce_backward_kernel(
     pg: torch.distributed.ProcessGroup | None = None,
     target_tile: torch.Tensor | None = None,
     c_grad_accum: torch.Tensor | None = None,
+    fp8: "CCEFp8Operands | None" = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert do.numel() in (e.size(0), 1)
     assert c.size(1) == e.size(1)
     assert lse.size(0) == e.size(0) or (valids is not None and lse.size(0) == valids.size(0))
+    if e.dtype == torch.float8_e4m3fn:
+        assert fp8 is not None, "FP8 operands need their scales and transposed copies"
+        assert c.dtype == e.dtype
+        assert fp8.e_transposed.shape == (e.size(1), e.size(0))
+        assert fp8.c_transposed.shape == (c.size(1), c.size(0))
+        assert fp8.e_transposed.is_contiguous() and fp8.c_transposed.is_contiguous()
+        assert fp8.e_scale.shape == (e.size(0),) and fp8.c_scale.shape == (c.size(0),)
+        assert fp8.e_transposed_scale.shape == (e.size(1),)
+        assert fp8.c_transposed_scale.shape == (c.size(1),)
+        assert softcap is None and bias is None, "FP8 operands: no softcap, no bias"
+        assert not accum_e_fp32 and not accum_c_fp32
+    else:
+        assert fp8 is None
 
     if not is_triton_greater_or_equal_3_2_0():
         assert e.dtype in (
@@ -464,6 +589,10 @@ def cce_backward_kernel(
     lse = lse.contiguous()
 
     de_dtype = torch.float32 if (accum_e_fp32 and can_use_fp32_accum) else None
+    if fp8 is not None:
+        # The embedding gradient lands in the caller's dtype, not the FP8
+        # operand's.
+        de_dtype = e_info.dtype
     de = torch.zeros_like(e, dtype=de_dtype) if e_info.requires_grad else None
 
     dc_dtype = torch.float32 if (accum_c_fp32 and can_use_fp32_accum) else None
@@ -480,6 +609,10 @@ def cce_backward_kernel(
         assert c_grad_accum.device == c.device
         dc = c_grad_accum
     else:
+        if fp8 is not None:
+            # The classifier gradient lands in the caller's dtype, not the
+            # FP8 operand's.
+            dc_dtype = c_info.dtype
         dc = torch.zeros_like(c, dtype=dc_dtype) if c_info.requires_grad else None
 
     accum_e_fp32 = accum_e_fp32 and de is not None
@@ -545,7 +678,7 @@ def cce_backward_kernel(
     # The tile grid the flags and the row max are indexed by exists only when
     # the block shape is fixed, which is also what couples this kernel's tiling
     # to the forward's.
-    block_shape = cce_fixed_block_shape(e.dtype)
+    block_shape = cce_fixed_block_shape(e.dtype, backward=True)
     if tile_flags is not None:
         assert block_shape is not None, "tile_flags needs the fixed (non-autotuned) config"
         assert tile_flags.dtype == torch.int32
@@ -588,6 +721,12 @@ def cce_backward_kernel(
     _cce_backward_kernel[grid](
         e,
         c,
+        None if fp8 is None else fp8.e_scale,
+        None if fp8 is None else fp8.c_scale,
+        None if fp8 is None else fp8.e_transposed,
+        None if fp8 is None else fp8.e_transposed_scale,
+        None if fp8 is None else fp8.c_transposed,
+        None if fp8 is None else fp8.c_transposed_scale,
         bias,
         lse,
         do,
