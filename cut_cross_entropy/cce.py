@@ -110,9 +110,12 @@ def _check_c_grad_accum(
     """Validate the caller's classifier gradient buffer against the operands.
 
     The backward hands the buffer straight to the kernel as ``dC``, so it has
-    to match the shape, dtype, device and layout of the classifier the kernel
+    to match the shape, device and layout of the classifier the kernel
     actually reads -- under autocast that is the cast operand, not the caller's
-    tensor -- and nothing here casts or reshapes it.  It must also be plain
+    tensor -- and nothing here casts or reshapes it.  Its dtype is the
+    classifier's or float32: the tile loop's lock-add loads, adds and stores
+    in the buffer's own dtype, so a float32 buffer accumulates every tile's
+    contribution in float32 however many token blocks a call spans.  It must also be plain
     storage of its own: a buffer that aliased ``e`` or ``c`` would have the
     kernel overwrite an operand it is still reading, and one carrying autograd
     history would be mutated behind a graph that expects to read it back.
@@ -140,9 +143,10 @@ def _check_c_grad_accum(
             f"c_grad_accum must have the classifier's shape {tuple(c.shape)}, "
             f"got {tuple(c_grad_accum.shape)}."
         )
-    if c_grad_accum.dtype != c.dtype:
+    if c_grad_accum.dtype not in (c.dtype, torch.float32):
         raise ValueError(
-            f"c_grad_accum must have the classifier's dtype {c.dtype}, got {c_grad_accum.dtype}."
+            f"c_grad_accum must have the classifier's dtype {c.dtype} or float32, "
+            f"got {c_grad_accum.dtype}."
         )
     if c_grad_accum.device != c.device:
         raise ValueError("c_grad_accum must live on the classifier's device.")
@@ -150,8 +154,8 @@ def _check_c_grad_accum(
         raise ValueError("c_grad_accum must have the classifier's layout.")
     if params.accum_c_fp32:
         raise ValueError(
-            "c_grad_accum carries the classifier's own dtype, so it is incompatible with "
-            "accum_c_fp32."
+            "c_grad_accum is accumulated in its own dtype by the tile loop, so it is "
+            "incompatible with accum_c_fp32; pass a float32 buffer instead."
         )
     if params.vocab_parallel_options is not None:
         raise ValueError(

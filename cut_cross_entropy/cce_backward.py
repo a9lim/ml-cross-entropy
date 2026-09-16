@@ -469,13 +469,14 @@ def cce_backward_kernel(
     dc_dtype = torch.float32 if (accum_c_fp32 and can_use_fp32_accum) else None
     if c_grad_accum is not None:
         # A caller-owned accumulator replaces the per-call zero tensor.  The
-        # tile loop's ``tl_lock_add`` always loads, adds and stores, so
-        # whatever the buffer already holds is accumulated onto; nothing here
+        # tile loop's ``tl_lock_add`` always loads, adds and stores in the
+        # buffer's own dtype, so whatever the buffer already holds is
+        # accumulated onto (in float32 for a float32 buffer); nothing here
         # zeroes it and no first writer initializes it.
         assert c_info.requires_grad, "c_grad_accum requires the classifier's gradient"
-        assert dc_dtype is None, "c_grad_accum carries the classifier's own dtype"
+        assert dc_dtype is None, "c_grad_accum accumulates in its own dtype"
         assert c_grad_accum.shape == c.shape
-        assert c_grad_accum.dtype == c.dtype
+        assert c_grad_accum.dtype in (c.dtype, torch.float32)
         assert c_grad_accum.device == c.device
         dc = c_grad_accum
     else:
