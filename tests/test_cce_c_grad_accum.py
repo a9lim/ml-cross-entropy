@@ -56,7 +56,8 @@ def _run(e, c, targets, ordering, accum):
     return loss.detach(), embeddings.grad, classifier.grad
 
 
-def test_buffer_receives_the_kernels_gradient_exactly():
+@pytest.mark.parametrize("accum_dtype", [torch.bfloat16, torch.float32])
+def test_buffer_receives_the_kernels_gradient_exactly(accum_dtype):
     """One forward, two backwards over one token tile: the destination is the
     only difference, so a zeroed buffer must come out bit-identical to the
     tensor the default path allocates, and a second backward must add to it
@@ -80,7 +81,7 @@ def test_buffer_receives_the_kernels_gradient_exactly():
         e=e,
         e_info=TensorInfo(torch.bfloat16, True),
         c=c,
-        c_info=TensorInfo(torch.bfloat16, True),
+        c_info=TensorInfo(accum_dtype, True),
         bias=None,
         bias_info=None,
         lse=forward.lse,
@@ -97,10 +98,15 @@ def test_buffer_receives_the_kernels_gradient_exactly():
         accum_e_fp32=False,
         accum_c_fp32=False,
     )
-    _, expected, _ = cce_backward_kernel(**arguments)
+    # Ask the ordinary path to retain the sink's precision. With one token
+    # tile, its optional FP32 compensated sum has only one contribution per
+    # classifier row, so both destinations must still agree bit for bit.
+    _, expected, _ = cce_backward_kernel(
+        **{**arguments, "accum_c_fp32": accum_dtype == torch.float32}
+    )
     assert expected.abs().sum() > 0
 
-    accum = torch.zeros_like(c)
+    accum = torch.zeros_like(c, dtype=accum_dtype)
     _, returned, _ = cce_backward_kernel(**arguments, c_grad_accum=accum)
     assert returned is None
     torch.testing.assert_close(accum, expected, rtol=0, atol=0)
@@ -109,19 +115,20 @@ def test_buffer_receives_the_kernels_gradient_exactly():
     torch.testing.assert_close(accum, expected + expected, rtol=0, atol=0)
 
 
-def test_buffer_accumulates_across_calls():
+@pytest.mark.parametrize("accum_dtype", [torch.bfloat16, torch.float32])
+def test_buffer_accumulates_across_calls(accum_dtype):
     """Four consecutive calls into one buffer carry all four gradients.
 
-    The reference is the FP32 sum the old caller kept, so the tolerance is the
-    BF16 rounding the buffer introduces -- the point here is that nothing is
-    dropped or overwritten, not how finely it is summed."""
+    The reference sums separately returned BF16 gradients in FP32. The same
+    tolerance covers BF16 sink rounding and the FP32 sink retaining bits the
+    reference rounded away; no contribution may be dropped or overwritten."""
     vocab, dim = 512, 64
     running = None
     accum = None
     for index in range(4):
         e, c, targets = _operands(128, vocab, dim, 11 + index)
         if accum is None:
-            accum = torch.zeros_like(c)
+            accum = torch.zeros_like(c, dtype=accum_dtype)
         ordering = _ordering(e, c)
         _, _, dc = _run(e, c, targets, ordering, None)
         contribution = dc.float()
@@ -134,13 +141,14 @@ def test_buffer_accumulates_across_calls():
     assert relative < 5e-3, relative
 
 
-def test_buffer_carries_the_gradient_of_a_non_autograd_operand():
+@pytest.mark.parametrize("accum_dtype", [torch.bfloat16, torch.float32])
+def test_buffer_carries_the_gradient_of_a_non_autograd_operand(accum_dtype):
     """The classifier operand need not carry autograd -- the buffer is what
     asks for dC to be computed. It is not what makes a backward happen: some
     input still has to require grad, which here is the embeddings."""
     e, c, targets = _operands(128, 512, 64, 23)
     assert not c.requires_grad
-    accum = torch.zeros_like(c)
+    accum = torch.zeros_like(c, dtype=accum_dtype)
     _, de, dc = _run(e, c, targets, None, accum)
     assert dc is None
     assert de is not None
@@ -151,8 +159,9 @@ def test_buffer_is_checked_against_the_operands():
     e, c, targets = _operands(128, 512, 64, 31)
     with pytest.raises(ValueError, match="shape"):
         _run(e, c, targets, None, torch.zeros_like(c[:-1]))
-    with pytest.raises(ValueError, match="dtype"):
-        _run(e, c, targets, None, torch.zeros_like(c, dtype=torch.float32))
+    for invalid_dtype in (torch.float16, torch.float64, torch.int32):
+        with pytest.raises(ValueError, match="dtype"):
+            _run(e, c, targets, None, torch.zeros_like(c, dtype=invalid_dtype))
     with pytest.raises(ValueError, match="autograd history"):
         _run(e, c, targets, None, torch.zeros_like(c).requires_grad_())
     # An alias of the classifier would be overwritten while it is being read.

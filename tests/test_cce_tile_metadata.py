@@ -6,6 +6,7 @@ import triton
 
 from cut_cross_entropy.cce_backward import cce_backward_kernel
 from cut_cross_entropy.cce_lse_forward import cce_lse_forward_kernel
+from cut_cross_entropy.tl_autotune import cce_fixed_block_shape
 from cut_cross_entropy.utils import TensorInfo
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
@@ -39,10 +40,11 @@ def test_target_tile_matches_membership_and_filtered_gradients(
         vocab_ordering=order,
         return_row_max=True,
     )
+    block_b, block_v = cce_fixed_block_shape(e, backward=True)
     actual_targets = targets[valids + shift] if valids is not None else targets
-    padded_order = torch.nn.functional.pad(order, (0, (-vocab) % 128), value=vocab)
+    padded_order = torch.nn.functional.pad(order, (0, (-vocab) % block_v), value=vocab)
     matches = actual_targets[:, None] == padded_order[None, :]
-    expected = torch.where(matches.any(1), matches.to(torch.int32).argmax(1) // 128, -1).to(
+    expected = torch.where(matches.any(1), matches.to(torch.int32).argmax(1) // block_v, -1).to(
         torch.int32
     )
     torch.testing.assert_close(ret.target_tile, expected, rtol=0, atol=0)
@@ -57,7 +59,7 @@ def test_target_tile_matches_membership_and_filtered_gradients(
     outputs = []
     for mode in ("late", "legacy_early", "metadata_early"):
         flags = torch.empty(
-            (triton.cdiv(rows, 128), triton.cdiv(vocab, 128)), device="cuda", dtype=torch.int32
+            (triton.cdiv(rows, block_b), triton.cdiv(vocab, block_v)), device="cuda", dtype=torch.int32
         )
         de, dc, _ = cce_backward_kernel(
             do=torch.ones((), device="cuda"),

@@ -678,7 +678,7 @@ def cce_backward_kernel(
     # The tile grid the flags and the row max are indexed by exists only when
     # the block shape is fixed, which is also what couples this kernel's tiling
     # to the forward's.
-    block_shape = cce_fixed_block_shape(e.dtype, backward=True)
+    block_shape = cce_fixed_block_shape(e, backward=True)
     if tile_flags is not None:
         assert block_shape is not None, "tile_flags needs the fixed (non-autotuned) config"
         assert tile_flags.dtype == torch.int32

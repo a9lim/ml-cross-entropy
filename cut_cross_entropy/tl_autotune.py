@@ -453,31 +453,9 @@ def get_autotune_config():
     ] + get_configs_io_bound()
 
 
-def _heuristics_from_config(
-    config: Config,
-    fp32_config: Config | None = None,
-    arg_name: str | None = None,
-    fp8_config: Config | None = None,
-) -> Callable[..., autotuner.Heuristics]:
-    """The fixed configuration as heuristics, selected by ``arg_name``'s dtype."""
-    if fp32_config is None and fp8_config is None:
-        return triton.heuristics(
-            {k: (lambda args, _v=v: _v) for k, v in config.all_kwargs().items()}
-        )
-    assert arg_name is not None
-    kwargs = config.all_kwargs()
-    by_dtype = {}
-    if fp32_config is not None:
-        by_dtype[torch.float32] = fp32_config.all_kwargs()
-    if fp8_config is not None:
-        by_dtype[torch.float8_e4m3fn] = fp8_config.all_kwargs()
-    assert all(other.keys() == kwargs.keys() for other in by_dtype.values())
-
-    def pick(args, key, default):
-        return by_dtype.get(args[arg_name].dtype, kwargs).get(key, default)
-
+def _heuristics_from_config(config: Config) -> Callable[..., autotuner.Heuristics]:
     return triton.heuristics(
-        {k: (lambda args, _k=k, _v=v: pick(args, _k, _v)) for k, v in kwargs.items()}
+        {k: (lambda args, _v=v: _v) for k, v in config.all_kwargs().items()}
     )
 
 
@@ -488,6 +466,13 @@ def _heuristics_from_config(
 # really hurts the gradient.
 def _cce_best_config() -> Config:
     return Config(dict(BLOCK_B=128, BLOCK_V=128, BLOCK_D=32), num_warps=4, num_stages=4)
+
+
+def _cce_best_config_hopper() -> Config:
+    # Larger token/reduction tiles reduce head time on GH200 across the
+    # screen, bridge and flagship training geometries. Keep vocab tiles
+    # unchanged; forward and backward must still share the complete config.
+    return Config(dict(BLOCK_B=256, BLOCK_V=128, BLOCK_D=64), num_warps=8, num_stages=3)
 
 
 def _cce_best_config_fp32() -> Config:
@@ -511,16 +496,22 @@ def _cce_best_config_fp8_backward() -> Config:
     return Config(dict(BLOCK_B=64, BLOCK_V=64, BLOCK_D=32), num_warps=4, num_stages=4)
 
 
-def _fixed_config_for(e_dtype: torch.dtype, backward: bool = False) -> Config:
-    if e_dtype == torch.float32:
+def _fixed_config_for(e: torch.Tensor, backward: bool = False) -> Config:
+    if e.dtype == torch.float32:
         return _cce_best_config_fp32()
-    if e_dtype == torch.float8_e4m3fn:
+    if e.dtype == torch.float8_e4m3fn:
         return _cce_best_config_fp8_backward() if backward else _cce_best_config_fp8()
+    if (
+        e.dtype == torch.bfloat16
+        and e.is_cuda
+        and torch.cuda.get_device_capability(e.device) == (9, 0)
+    ):
+        return _cce_best_config_hopper()
     return _cce_best_config()
 
 
 def cce_fixed_block_shape(
-    e_dtype: torch.dtype, backward: bool = False
+    e: torch.Tensor, backward: bool = False
 ) -> tuple[int, int] | None:
     """(BLOCK_B, BLOCK_V) of the fixed config, or None when autotuning.
 
@@ -531,8 +522,20 @@ def cce_fixed_block_shape(
     if _AUTOTUNE:
         return None
 
-    kwargs = _fixed_config_for(e_dtype, backward).kwargs
+    kwargs = _fixed_config_for(e, backward).kwargs
     return int(kwargs["BLOCK_B"]), int(kwargs["BLOCK_V"])
+
+
+def _cce_fixed_heuristics(backward: bool = False) -> Callable[..., autotuner.Heuristics]:
+    # Resolve from the input at launch, using the same selector as metadata.
+    # Decorating/importing a kernel must not initialize CUDA on device zero
+    # before a distributed process selects its execution device.
+    return triton.heuristics(
+        {
+            key: (lambda args, _key=key: _fixed_config_for(args["E"], backward).all_kwargs()[_key])
+            for key in _cce_best_config().all_kwargs()
+        }
+    )
 
 
 assert (
@@ -555,9 +558,7 @@ def cce_forward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heur
             reset_to_zero=["LA"],
         )
     else:
-        return _heuristics_from_config(
-            _cce_best_config(), _cce_best_config_fp32(), "E", _cce_best_config_fp8()
-        )
+        return _cce_fixed_heuristics()
 
 
 def _bw_total_ops_fn(B, V, D) -> float:
@@ -587,9 +588,7 @@ def cce_backward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heu
             reset_to_zero=["dE", "dC", "dEC", "dCC", "dBias"],
         )
     else:
-        return _heuristics_from_config(
-            _cce_best_config(), _cce_best_config_fp32(), "E", _cce_best_config_fp8_backward()
-        )
+        return _cce_fixed_heuristics(backward=True)
 
 
 def _indexed_dot_best_config() -> Config:

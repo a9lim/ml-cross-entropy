@@ -299,7 +299,7 @@ def cce_lse_forward_kernel(
         assert vocab_ordering is not None, "the row max is only valid for a known vocab tiling"
         assert targets is not None, "the row max excludes the target column"
         assert softcap is None, "softcap is applied at a different width in the backward"
-        block_shape = cce_fixed_block_shape(e.dtype)
+        block_shape = cce_fixed_block_shape(e)
         assert block_shape is not None, "the row max needs the fixed (non-autotuned) config"
         # [vocab tile, row]: every element is written by exactly one program,
         # before any backward program reads it, so it needs no initialization.

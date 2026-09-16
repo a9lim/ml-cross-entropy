@@ -113,7 +113,7 @@ def _check_vocab_ordering(
             "vocab_ordering is not supported with vocab parallelism: each rank holds only a "
             "slice of the classifier, so a global permutation does not tile it."
         )
-    if cce_fixed_block_shape(e.dtype) is None:
+    if cce_fixed_block_shape(e) is None:
         raise ValueError(
             "vocab_ordering requires the fixed (non-autotuned) block shape, so that the "
             "forward and the backward walk the same tile grid. Unset CCE_AUTOTUNE."
@@ -147,7 +147,7 @@ def _check_c_grad_accum(
                 f"c_grad_accum must not share storage with {name}: the backward writes "
                 "the buffer while it is still reading the operands."
             )
-    if cce_fixed_block_shape(e.dtype) is None:
+    if cce_fixed_block_shape(e) is None:
         # The autotuner's reset_to_zero clears dC before each candidate, which
         # would silently drop whatever the buffer had already accumulated.
         raise ValueError(

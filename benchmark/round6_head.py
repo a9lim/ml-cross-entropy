@@ -209,7 +209,7 @@ def main():
         # geometries, so report the kept fraction and grid as well.
         from cut_cross_entropy.tl_autotune import cce_fixed_block_shape
 
-        bb, bv = cce_fixed_block_shape(e.dtype)
+        bb, bv = cce_fixed_block_shape(e)
         flags = torch.empty(
             ((e.shape[0] + bb - 1) // bb, (c.shape[0] + bv - 1) // bv),
             device="cuda",
