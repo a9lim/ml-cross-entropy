@@ -56,15 +56,29 @@ def _run(e, c, targets, ordering, accum):
     return loss.detach(), embeddings.grad, classifier.grad
 
 
-@pytest.mark.parametrize("accum_dtype", [torch.bfloat16, torch.float32])
-def test_buffer_receives_the_kernels_gradient_exactly(accum_dtype):
-    """One forward, two backwards over one token tile: the destination is the
-    only difference, so a zeroed buffer must come out bit-identical to the
-    tensor the default path allocates, and a second backward must add to it
-    rather than replace it. (Two separate forwards could not be compared this
-    way: the LSE lock combines its vocabulary tiles in an arbitrary order.)"""
+@pytest.mark.parametrize(
+    ("accum_dtype", "exact_repeat"),
+    [(torch.bfloat16, True), (torch.float32, False), (torch.float32, True)],
+    ids=["bf16-random", "fp32-random", "fp32-exact-repeat"],
+)
+def test_buffer_receives_the_kernels_gradient_exactly(accum_dtype, exact_repeat):
+    """One forward over one token tile makes zero-sink destinations comparable.
+
+    FP32 can fuse the existing sink into MMA accumulation, so two rounded
+    contributions need not equal a repeated accumulation bit for bit. Retain
+    the random first-write comparison, and use exactly representable products
+    for its exact repeat check. BF16 rounds each tile before adding it and
+    keeps its original random repeat check. Reuse one forward because the LSE
+    locks can combine vocabulary tiles in a different order on a second one.
+    """
     rows, vocab, dim = 128, 512, 64
     e, c, targets = _operands(rows, vocab, dim, 7)
+    if accum_dtype == torch.float32 and exact_repeat:
+        # Uniform probabilities for V=512, binary gradient scaling (1/128),
+        # and small integer/8 embeddings keep the entire dot and its doubled
+        # sum exactly representable in FP32 regardless of MMA accumulation.
+        e.copy_(torch.randint(-4, 5, e.shape, device=e.device).to(e.dtype) * 0.125)
+        c.zero_()
     order = torch.randperm(vocab, device="cuda").to(torch.int32)
     forward = cce_lse_forward_kernel(
         e,
@@ -98,9 +112,8 @@ def test_buffer_receives_the_kernels_gradient_exactly(accum_dtype):
         accum_e_fp32=False,
         accum_c_fp32=False,
     )
-    # Ask the ordinary path to retain the sink's precision. With one token
-    # tile, its optional FP32 compensated sum has only one contribution per
-    # classifier row, so both destinations must still agree bit for bit.
+    # Ask the ordinary path to retain the sink's precision. Current Triton
+    # uses a native FP32 buffer, with the same arithmetic as a supplied sink.
     _, expected, _ = cce_backward_kernel(
         **{**arguments, "accum_c_fp32": accum_dtype == torch.float32}
     )
@@ -111,8 +124,9 @@ def test_buffer_receives_the_kernels_gradient_exactly(accum_dtype):
     assert returned is None
     torch.testing.assert_close(accum, expected, rtol=0, atol=0)
 
-    cce_backward_kernel(**arguments, c_grad_accum=accum)
-    torch.testing.assert_close(accum, expected + expected, rtol=0, atol=0)
+    if exact_repeat:
+        cce_backward_kernel(**arguments, c_grad_accum=accum)
+        torch.testing.assert_close(accum, expected + expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("accum_dtype", [torch.bfloat16, torch.float32])
